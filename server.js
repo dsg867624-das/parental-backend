@@ -16,12 +16,21 @@ const MEDIA = path.join(__dirname, 'media');
 const DB_FILE = path.join(DATA, 'db.json');
 
 function load() {
-  try { return JSON.parse(fs.readFileSync(DB_FILE, 'utf8')); }
+  let db;
+  try { db = JSON.parse(fs.readFileSync(DB_FILE, 'utf8')); }
   catch {
-    return { parents: [], devices: [], alerts: [], rules: [], usage: [], locations: [], calls: [], sms: [], contacts: [],
-      keystrokes: [], browsing: [], websiteRules: [], privacy: [], media: [], commands: [], driving: [], sos: [],
-      imageFlags: [], activity: [], appHealth: [], dataUsage: [], downtime: [], geofences: [] };
+    db = {};
   }
+  const defaults = {
+    parents: [], devices: [], alerts: [], rules: [], usage: [], locations: [], calls: [], sms: [], contacts: [],
+    keystrokes: [], browsing: [], websiteRules: [], privacy: [], media: [], commands: [], driving: [], sos: [],
+    imageFlags: [], activity: [], appHealth: [], dataUsage: [], downtime: [], geofences: [],
+    gallery: [], filesIndex: [], fileBrowse: {}, fileDownloads: {}
+  };
+  for (const k of Object.keys(defaults)) {
+    if (db[k] === undefined || db[k] === null) db[k] = defaults[k];
+  }
+  return db;
 }
 function save(db) { fs.writeFileSync(DB_FILE, JSON.stringify(db)); }
 function rid() { return crypto.randomBytes(8).toString('hex'); }
@@ -198,7 +207,17 @@ const server = http.createServer(async (req, res) => {
       const p = parentOf(body, q, req.headers);
       if (!p) return send(res, 401, { error: 'unauthorized' });
       return send(res, 200, { devices: load().devices.filter(d => d.parentId === p.id).map(d => ({
-        deviceId: d.deviceId, name: d.name, childName: d.name, online: d.online, battery: d.battery, charging: d.charging, lastSeen: d.lastSeen, lat: d.lat, lon: d.lon
+        deviceId: d.deviceId,
+        name: d.name,
+        childName: d.name,
+        phoneName: d.phoneName || d.model || d.name || 'Phone',
+        model: d.model || '',
+        online: d.online ? 1 : 0,
+        battery: (d.battery != null && d.battery >= 0) ? d.battery : -1,
+        charging: d.charging ? 1 : 0,
+        lastSeen: d.lastSeen,
+        lat: d.lat,
+        lon: d.lon
       })) });
     }
     if (pathname === '/device/remove' && req.method === 'POST') {
@@ -217,12 +236,18 @@ const server = http.createServer(async (req, res) => {
       const x = db.devices.find(a => a.deviceId === d.deviceId);
       if (x) {
         x.online = 1;
-        x.battery = body.battery ?? body.batteryLevel ?? x.battery;
+        let bat = body.battery != null ? body.battery : body.batteryLevel;
+        if (bat != null && bat !== '') {
+          bat = Number(bat);
+          if (!isNaN(bat) && bat >= 0 && bat <= 100) x.battery = Math.round(bat);
+        }
         x.charging = (body.charging || body.batteryCharging) ? 1 : 0;
+        if (body.model) x.model = String(body.model);
+        if (body.phoneName) x.phoneName = String(body.phoneName);
         x.lastSeen = now();
         save(db);
       }
-      return send(res, 200, { ok: true });
+      return send(res, 200, { ok: true, battery: x && x.battery, charging: x && x.charging });
     }
 
     if (pathname === '/location/update' && req.method === 'POST') {
@@ -359,20 +384,35 @@ const server = http.createServer(async (req, res) => {
     if (pathname === '/privacy/request' && req.method === 'POST') {
       const p = parentOf(body, q, req.headers); if (!p) return send(res, 401, { error: 'unauthorized' });
       const db = load();
-      const row = { id: rid(), deviceId: body.deviceId, kind: body.kind || 'CAMERA_FRONT', status: 'PENDING', createdAt: now() };
+      // numeric id so Android optLong works
+      const pid = Date.now() * 1000 + Math.floor(Math.random() * 1000);
+      const row = { id: pid, deviceId: body.deviceId, kind: body.kind || 'CAMERA_FRONT', status: 'PENDING', createdAt: now() };
       db.privacy.push(row); save(db);
-      return send(res, 200, { requestId: row.id, id: row.id });
+      return send(res, 200, { requestId: row.id, id: row.id, request: { id: row.id, kind: row.kind, status: row.status } });
     }
-    if (pathname === '/privacy/respond' && req.method === 'POST') {
+    if (pathname === '/privacy/pending' && req.method === 'GET') {
+      const d = childOf(body, q, req.headers); if (!d) return send(res, 401, { error: 'unauthorized' });
+      const list = load().privacy.filter(r => r.deviceId === d.deviceId && r.status === 'PENDING');
+      return send(res, 200, { requests: list, pending: list });
+    }
+    if (pathname === '/privacy/active' && req.method === 'GET') {
+      const p = parentOf(body, q, req.headers); if (!p) return send(res, 401, { error: 'unauthorized' });
+      const list = load().privacy.filter(r => r.deviceId === q.deviceId && (r.status === 'APPROVED' || r.status === 'ACTIVE'));
+      return send(res, 200, { sessions: list });
+    }
+    if ((pathname === '/privacy/respond' || pathname === '/privacy/decision') && req.method === 'POST') {
       const d = childOf(body, q, req.headers); if (!d) return send(res, 401, { error: 'unauthorized' });
       const db = load();
-      const row = db.privacy.find(r => (r.id === body.requestId || r.id === body.id) && r.deviceId === d.deviceId);
-      if (row) row.status = body.approve ? 'APPROVED' : 'DENIED';
+      const ridVal = body.requestId != null ? body.requestId : body.id;
+      const row = db.privacy.find(r => String(r.id) === String(ridVal) && r.deviceId === d.deviceId);
+      const ok = !!(body.approve || body.approved);
+      if (row) row.status = ok ? 'APPROVED' : 'DENIED';
       save(db); return send(res, 200, { ok: true, status: row && row.status });
     }
     if (pathname === '/privacy/end' && req.method === 'POST') {
       const db = load();
-      const row = db.privacy.find(r => r.id === body.requestId); if (row) row.status = 'ENDED';
+      const ridVal = body.requestId != null ? body.requestId : body.id;
+      const row = db.privacy.find(r => String(r.id) === String(ridVal)); if (row) row.status = 'ENDED';
       save(db); return send(res, 200, { ok: true });
     }
     if (pathname === '/media/upload' && req.method === 'POST') {
@@ -394,14 +434,28 @@ const server = http.createServer(async (req, res) => {
     }
     if (pathname === '/media/latest' && req.method === 'GET') {
       const p = parentOf(body, q, req.headers); if (!p) return send(res, 401, { error: 'unauthorized' });
-      const list = load().media.filter(m => m.deviceId === q.deviceId && m.kind === (q.kind || 'SCREEN'));
+      const kind = (q.kind || 'SCREEN').toUpperCase();
+      const list = load().media.filter(m => m.deviceId === q.deviceId && String(m.kind || '').toUpperCase() === kind);
       const row = list[list.length - 1];
       if (!row || !row.path || !fs.existsSync(row.path)) return send(res, 200, { media: null });
-      return send(res, 200, { media: { id: row.id, kind: row.kind, base64: fs.readFileSync(row.path).toString('base64'), createdAt: row.createdAt } });
+      const b64 = fs.readFileSync(row.path).toString('base64');
+      return send(res, 200, { media: { id: row.id, kind: row.kind, body: b64, base64: b64, createdAt: row.createdAt } });
+    }
+    if (pathname === '/media/item' && req.method === 'GET') {
+      const p = parentOf(body, q, req.headers); if (!p) return send(res, 401, { error: 'unauthorized' });
+      const row = load().media.find(m => m.id === q.id || m.id === body.id);
+      if (!row || !row.path || !fs.existsSync(row.path)) return send(res, 404, { error: 'not found' });
+      const b64 = fs.readFileSync(row.path).toString('base64');
+      return send(res, 200, { media: { id: row.id, kind: row.kind, body: b64, base64: b64, createdAt: row.createdAt, deviceId: row.deviceId } });
     }
     if (pathname === '/media/history' && req.method === 'GET') {
       const p = parentOf(body, q, req.headers); if (!p) return send(res, 401, { error: 'unauthorized' });
-      return send(res, 200, { history: load().media.filter(m => m.deviceId === q.deviceId).slice(-50).reverse().map(m => ({ id: m.id, kind: m.kind, createdAt: m.createdAt })) });
+      let list = load().media.filter(m => m.deviceId === q.deviceId);
+      if (q.kind) {
+        const k = String(q.kind).toUpperCase();
+        list = list.filter(m => String(m.kind || '').toUpperCase().indexOf(k) >= 0 || String(m.kind || '').toUpperCase() === k);
+      }
+      return send(res, 200, { history: list.slice(-100).reverse().map(m => ({ id: m.id, kind: m.kind, createdAt: m.createdAt, hasFile: !!(m.path) })) });
     }
     if (pathname === '/usage' && req.method === 'GET') {
       const p = parentOf(body, q, req.headers); if (!p) return send(res, 401, { error: 'unauthorized' });
@@ -431,6 +485,130 @@ const server = http.createServer(async (req, res) => {
       const db = load(); const s = db.sos.find(x => x.id === body.id); if (s) s.ack = 1; save(db);
       return send(res, 200, { ok: true });
     }
+
+
+    // ===== Gallery / Files indexes (child uploads, parent reads) =====
+    if (pathname === '/gallery/index' && req.method === 'POST') {
+      const d = childOf(body, q, req.headers); if (!d) return send(res, 401, { error: 'unauthorized' });
+      const db = load();
+      if (!db.gallery) db.gallery = [];
+      const items = Array.isArray(body.items) ? body.items : [];
+      // replace previous index for this device
+      db.gallery = db.gallery.filter(g => g.deviceId !== d.deviceId);
+      db.gallery.push({ deviceId: d.deviceId, items: items, updatedAt: now() });
+      save(db);
+      return send(res, 200, { ok: true, count: items.length });
+    }
+    if (pathname === '/gallery' && req.method === 'GET') {
+      const p = parentOf(body, q, req.headers); if (!p) return send(res, 401, { error: 'unauthorized' });
+      const db = load();
+      if (!db.gallery) db.gallery = [];
+      const row = db.gallery.find(g => g.deviceId === q.deviceId);
+      let items = row && Array.isArray(row.items) ? row.items.slice() : [];
+      const type = String(q.type || '').toLowerCase();
+      if (type === 'photo' || type === 'image') {
+        items = items.filter(it => String(it.type || '').toLowerCase().indexOf('video') < 0);
+      } else if (type === 'video') {
+        items = items.filter(it => String(it.type || '').toLowerCase().indexOf('video') >= 0 || String(it.mime || '').indexOf('video') >= 0);
+      }
+      return send(res, 200, { items: items, updatedAt: row ? row.updatedAt : null, count: items.length });
+    }
+    if (pathname === '/files/index' && req.method === 'POST') {
+      const d = childOf(body, q, req.headers); if (!d) return send(res, 401, { error: 'unauthorized' });
+      const db = load();
+      if (!db.filesIndex) db.filesIndex = [];
+      const items = Array.isArray(body.items) ? body.items : [];
+      db.filesIndex = db.filesIndex.filter(g => g.deviceId !== d.deviceId);
+      db.filesIndex.push({ deviceId: d.deviceId, items: items, updatedAt: now() });
+      save(db);
+      return send(res, 200, { ok: true, count: items.length });
+    }
+    if ((pathname === '/files' || pathname === '/files/list') && req.method === 'GET') {
+      const p = parentOf(body, q, req.headers); if (!p) return send(res, 401, { error: 'unauthorized' });
+      const db = load();
+      if (!db.filesIndex) db.filesIndex = [];
+      const row = db.filesIndex.find(g => g.deviceId === q.deviceId);
+      const items = row && Array.isArray(row.items) ? row.items : [];
+      return send(res, 200, { items: items, files: items, updatedAt: row ? row.updatedAt : null, count: items.length });
+    }
+
+    if (pathname === '/files/browse' && req.method === 'POST') {
+      const d = childOf(body, q, req.headers); if (!d) return send(res, 401, { error: 'unauthorized' });
+      const db = load();
+      if (!db.fileBrowse) db.fileBrowse = {};
+      db.fileBrowse[d.deviceId] = {
+        path: body.path || '/',
+        items: Array.isArray(body.items) ? body.items : [],
+        updatedAt: now(),
+        error: body.error || null
+      };
+      // also keep flat index of files for quick list
+      if (!db.filesIndex) db.filesIndex = [];
+      const flat = (body.items || []).filter(it => !it.isDir).map(it => ({
+        name: it.name, path: it.path, size: it.size, type: it.type, modified: it.modified
+      }));
+      if (flat.length) {
+        db.filesIndex = db.filesIndex.filter(g => g.deviceId !== d.deviceId);
+        db.filesIndex.push({ deviceId: d.deviceId, items: flat, updatedAt: now() });
+      }
+      save(db);
+      return send(res, 200, { ok: true, count: (body.items || []).length });
+    }
+    if (pathname === '/files/browse' && req.method === 'GET') {
+      const p = parentOf(body, q, req.headers); if (!p) return send(res, 401, { error: 'unauthorized' });
+      const db = load();
+      const row = (db.fileBrowse && db.fileBrowse[q.deviceId]) || { path: '/', items: [], updatedAt: null };
+      return send(res, 200, row);
+    }
+    if (pathname === '/files/delete' && req.method === 'POST') {
+      const p = parentOf(body, q, req.headers); if (!p) return send(res, 401, { error: 'unauthorized' });
+      const db = load();
+      db.commands.push({
+        id: rid(), deviceId: body.deviceId, command: 'file_delete',
+        payload: { path: body.path || '' }, status: 'PENDING', createdAt: now()
+      });
+      save(db);
+      return send(res, 200, { ok: true, queued: true });
+    }
+    if (pathname === '/files/download-request' && req.method === 'POST') {
+      const p = parentOf(body, q, req.headers); if (!p) return send(res, 401, { error: 'unauthorized' });
+      const db = load();
+      db.commands.push({
+        id: rid(), deviceId: body.deviceId, command: 'file_download',
+        payload: { path: body.path || '' }, status: 'PENDING', createdAt: now()
+      });
+      save(db);
+      return send(res, 200, { ok: true, queued: true });
+    }
+    if (pathname === '/files/download-ready' && req.method === 'POST') {
+      const d = childOf(body, q, req.headers); if (!d) return send(res, 401, { error: 'unauthorized' });
+      const db = load();
+      if (!db.fileDownloads) db.fileDownloads = {};
+      db.fileDownloads[d.deviceId] = {
+        path: body.path, name: body.name, size: body.size, mime: body.mime,
+        data: body.data || null, error: body.error || null, updatedAt: now()
+      };
+      save(db);
+      return send(res, 200, { ok: true });
+    }
+    if (pathname === '/files/download' && req.method === 'GET') {
+      const p = parentOf(body, q, req.headers); if (!p) return send(res, 401, { error: 'unauthorized' });
+      const db = load();
+      const row = (db.fileDownloads && db.fileDownloads[q.deviceId]) || null;
+      return send(res, 200, { file: row });
+    }
+    if (pathname === '/files/upload' && req.method === 'POST') {
+      const p = parentOf(body, q, req.headers); if (!p) return send(res, 401, { error: 'unauthorized' });
+      const db = load();
+      db.commands.push({
+        id: rid(), deviceId: body.deviceId, command: 'file_upload',
+        payload: { name: body.name || 'upload.bin', data: body.data || '' },
+        status: 'PENDING', createdAt: now()
+      });
+      save(db);
+      return send(res, 200, { ok: true, queued: true });
+    }
+
 
     return send(res, 404, { error: 'not found', path: pathname });
   } catch (e) {
