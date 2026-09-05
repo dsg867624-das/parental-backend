@@ -1,0 +1,240 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>Parent Control · Web Dashboard</title>
+<style>
+:root{--bg:#0b1220;--card:#151c2e;--line:#243049;--text:#eef2ff;--muted:#93a0b8;--blue:#4f7cff;--green:#22c55e;--red:#ef4444}
+*{box-sizing:border-box}body{margin:0;font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;background:var(--bg);color:var(--text)}
+header{padding:16px 20px;border-bottom:1px solid var(--line);display:flex;gap:12px;flex-wrap:wrap;align-items:center}
+header h1{font-size:18px;margin:0;flex:1}
+.card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:14px;margin:12px}
+input,select,button,textarea{border-radius:10px;border:1px solid var(--line);background:#0f172a;color:var(--text);padding:10px 12px;font-size:14px}
+button{background:var(--blue);border:none;cursor:pointer;font-weight:600}
+button.secondary{background:#243049}
+button.danger{background:var(--red)}
+.row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+.tabs{display:flex;gap:6px;flex-wrap:wrap;padding:0 12px}
+.tabs button{background:#1a2236}
+.tabs button.active{background:var(--blue)}
+#view{padding:4px 12px 40px}
+table{width:100%;border-collapse:collapse;font-size:13px}
+td,th{border-bottom:1px solid var(--line);padding:8px;text-align:left;vertical-align:top}
+.muted{color:var(--muted);font-size:12px}
+#map{height:360px;border-radius:12px;overflow:hidden;background:#0f172a}
+.hidden{display:none}
+.pill{display:inline-block;padding:2px 8px;border-radius:999px;background:#243049;font-size:11px}
+</style>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+</head>
+<body>
+<header>
+  <h1>Parent Control · Web</h1>
+  <span id="who" class="muted">Not signed in</span>
+</header>
+<div id="login" class="card">
+  <h3>Sign in</h3>
+  <div class="row">
+    <input id="email" placeholder="Email" style="min-width:200px"/>
+    <input id="password" type="password" placeholder="Password" style="min-width:160px"/>
+    <button onclick="doLogin()">Login</button>
+    <button class="secondary" onclick="doRegister()">Register</button>
+  </div>
+  <p class="muted">Same account as Parent app. Backend: this server.</p>
+</div>
+<div id="app" class="hidden">
+  <div class="card row">
+    <div style="flex:1">
+      <div class="muted">Family code</div>
+      <div id="familyCode" style="font-size:28px;font-weight:800;letter-spacing:2px;color:var(--blue)">--------</div>
+    </div>
+    <select id="deviceSel" style="min-width:180px"></select>
+    <button class="secondary" onclick="refreshAll()">Refresh</button>
+    <button class="danger" onclick="logout()">Logout</button>
+  </div>
+  <div class="tabs">
+    <button class="active" data-tab="home" onclick="tab('home')">Home</button>
+    <button data-tab="location" onclick="tab('location')">Location</button>
+    <button data-tab="comm" onclick="tab('comm')">Calls / SMS / Contacts</button>
+    <button data-tab="media" onclick="tab('media')">Media</button>
+  </div>
+  <div id="view">
+    <section id="tab-home">
+      <div class="card"><div id="homeInfo" class="muted">Select a child device.</div></div>
+    </section>
+    <section id="tab-location" class="hidden">
+      <div class="card">
+        <div class="row">
+          <button onclick="loadLocation()">Live location</button>
+          <button class="secondary" onclick="loadHistory()">7-day history path</button>
+        </div>
+        <div id="locText" class="muted" style="margin:8px 0"></div>
+        <div id="map"></div>
+      </div>
+    </section>
+    <section id="tab-comm" class="hidden">
+      <div class="card row">
+        <button onclick="loadComm('calls')">Calls</button>
+        <button onclick="loadComm('sms')">SMS</button>
+        <button onclick="loadComm('contacts')">Contacts</button>
+      </div>
+      <div class="card"><div id="commBox" class="muted">Choose Calls / SMS / Contacts</div></div>
+    </section>
+    <section id="tab-media" class="hidden">
+      <div class="card">
+        <div class="row">
+          <button onclick="loadMedia('CAMERA_FRONT')">Latest camera</button>
+          <button onclick="loadMedia('SCREEN')">Latest screen</button>
+          <button class="secondary" onclick="loadMediaHistory()">Media history</button>
+        </div>
+        <div id="mediaStatus" class="muted" style="margin-top:8px"></div>
+        <img id="mediaImg" style="max-width:100%;border-radius:12px;margin-top:8px;display:none"/>
+      </div>
+    </section>
+  </div>
+</div>
+<script>
+const API = location.origin + '/';
+let token = localStorage.getItem('pc_token') || '';
+let devices = [];
+let map, marker, line;
+
+function $(id){return document.getElementById(id)}
+async function api(path, opt={}){
+  const r = await fetch(API + path.replace(/^\//,''), {
+    method: opt.method || 'GET',
+    headers: {'Content-Type':'application/json', ...(opt.headers||{})},
+    body: opt.body ? JSON.stringify(opt.body) : undefined
+  });
+  const j = await r.json().catch(()=>({}));
+  if(!r.ok) throw new Error(j.error || r.statusText);
+  return j;
+}
+function showApp(on){
+  $('login').classList.toggle('hidden', on);
+  $('app').classList.toggle('hidden', !on);
+}
+async function doLogin(){
+  try{
+    const j = await api('auth/login',{method:'POST',body:{email:$('email').value.trim(), password:$('password').value}});
+    token = j.sessionToken || j.token;
+    localStorage.setItem('pc_token', token);
+    await boot();
+  }catch(e){alert('Login failed: '+e.message)}
+}
+async function doRegister(){
+  try{
+    const j = await api('auth/register',{method:'POST',body:{email:$('email').value.trim(), password:$('password').value}});
+    token = j.sessionToken || j.token;
+    localStorage.setItem('pc_token', token);
+    await boot();
+  }catch(e){alert('Register failed: '+e.message)}
+}
+function logout(){token='';localStorage.removeItem('pc_token');showApp(false);$('who').textContent='Not signed in'}
+function deviceId(){return $('deviceSel').value}
+async function boot(){
+  if(!token){showApp(false);return}
+  try{
+    const me = await api('auth/me?sessionToken='+encodeURIComponent(token));
+    $('who').textContent = me.email || me.parent?.email || 'Signed in';
+    $('familyCode').textContent = me.familyCode || me.parent?.familyCode || '--------';
+    const d = await api('devices?sessionToken='+encodeURIComponent(token));
+    devices = d.devices || d.children || [];
+    $('deviceSel').innerHTML = devices.map(x=>`<option value="${x.deviceId}">${x.name||x.phoneName||x.deviceId} · bat ${x.battery??'?'}%</option>`).join('') || '<option value="">No devices</option>';
+    showApp(true);
+    refreshHome();
+  }catch(e){logout();alert('Session expired')}
+}
+function tab(name){
+  document.querySelectorAll('.tabs button').forEach(b=>b.classList.toggle('active', b.dataset.tab===name));
+  ['home','location','comm','media'].forEach(n=>$('tab-'+n).classList.toggle('hidden', n!==name));
+  if(name==='location') setTimeout(()=>{ensureMap();loadLocation()}, 50);
+}
+function refreshHome(){
+  const d = devices.find(x=>x.deviceId===deviceId()) || devices[0];
+  if(!d){$('homeInfo').textContent='No paired children yet. Pair from Child app with Family Code.';return}
+  $('homeInfo').innerHTML = `<b>${d.name||'Child'}</b><br>
+    Phone: ${d.phoneName||d.model||'-'}<br>
+    Battery: ${d.battery??'?'}% ${d.charging?'charging':''}<br>
+    Last seen: ${d.lastSeen||'-'}<br>
+    <span class="pill">${d.online?'ONLINE':'offline'}</span>`;
+}
+function refreshAll(){boot()}
+function ensureMap(){
+  if(map) return;
+  map = L.map('map').setView([20.5,78.9], 5);
+  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',{maxZoom:19}).addTo(map);
+}
+async function loadLocation(){
+  try{
+    const j = await api('location?sessionToken='+encodeURIComponent(token)+'&deviceId='+encodeURIComponent(deviceId())+'&_t='+Date.now());
+    const p = j.latest || j.location || (j.locations&&j.locations[0]);
+    if(!p){$('locText').textContent='No location yet';return}
+    const lat=p.latitude??p.lat, lon=p.longitude??p.lon;
+    $('locText').textContent = `LIVE ${lat.toFixed(5)}, ${lon.toFixed(5)} · ±${Math.round(p.accuracy||0)}m · ${p.createdAt||''}`;
+    ensureMap();
+    if(marker) map.removeLayer(marker);
+    marker = L.marker([lat,lon]).addTo(map).bindPopup('Live').openPopup();
+    map.setView([lat,lon], 16);
+  }catch(e){$('locText').textContent='Error: '+e.message}
+}
+async function loadHistory(){
+  try{
+    const j = await api('location/history?sessionToken='+encodeURIComponent(token)+'&deviceId='+encodeURIComponent(deviceId())+'&days=7');
+    const pts = j.points || j.locations || [];
+    $('locText').textContent = `7-day path · ${pts.length} points`;
+    ensureMap();
+    if(line) map.removeLayer(line);
+    const latlngs = pts.map(p=>[p.latitude??p.lat, p.longitude??p.lon]).filter(x=>x[0]&&x[1]);
+    if(latlngs.length){
+      line = L.polyline(latlngs,{color:'#4f7cff',weight:4}).addTo(map);
+      map.fitBounds(line.getBounds(),{padding:[30,30]});
+      const last=latlngs[latlngs.length-1];
+      if(marker) map.removeLayer(marker);
+      marker = L.marker(last).addTo(map);
+    }
+  }catch(e){$('locText').textContent='History error: '+e.message}
+}
+async function loadComm(kind){
+  try{
+    const j = await api(kind+'?sessionToken='+encodeURIComponent(token)+'&deviceId='+encodeURIComponent(deviceId()));
+    const list = j[kind] || j.items || j.messages || [];
+    if(!list.length){$('commBox').textContent='No data. Open Parent app Sync or wait for child upload.';return}
+    let html = `<table><tr><th>${kind}</th></tr>`;
+    list.slice(0,100).forEach(o=>{
+      if(kind==='calls') html += `<tr><td><b>${o.direction||''}</b> ${o.number||''} · ${o.durationSeconds||o.duration||0}s<br><span class="muted">${o.createdAt||''}</span></td></tr>`;
+      else if(kind==='sms') html += `<tr><td><b>${o.direction||''}</b> ${o.address||''}<br>${(o.body||'').slice(0,180)}<br><span class="muted">${o.createdAt||''}</span></td></tr>`;
+      else html += `<tr><td><b>${o.name||''}</b><br>${o.number||''}</td></tr>`;
+    });
+    html += '</table>';
+    $('commBox').innerHTML = html;
+  }catch(e){$('commBox').textContent=e.message}
+}
+async function loadMedia(kind){
+  try{
+    const j = await api('media/latest?sessionToken='+encodeURIComponent(token)+'&deviceId='+encodeURIComponent(deviceId())+'&kind='+kind);
+    const m = j.media;
+    if(!m){$('mediaStatus').textContent='No capture';$('mediaImg').style.display='none';return}
+    const b64 = m.body||m.base64;
+    $('mediaStatus').textContent = kind+' · '+ (m.createdAt||'');
+    if(b64 && kind.indexOf('AUDIO')<0){
+      $('mediaImg').src = 'data:image/jpeg;base64,'+b64;
+      $('mediaImg').style.display='block';
+    }
+  }catch(e){$('mediaStatus').textContent=e.message}
+}
+async function loadMediaHistory(){
+  try{
+    const j = await api('media/history?sessionToken='+encodeURIComponent(token)+'&deviceId='+encodeURIComponent(deviceId()));
+    const list = j.media || j.items || [];
+    $('mediaStatus').textContent = 'History items: '+list.length;
+  }catch(e){$('mediaStatus').textContent=e.message}
+}
+$('deviceSel').addEventListener('change', ()=>{refreshHome();});
+if(token) boot();
+</script>
+</body>
+</html>
+
