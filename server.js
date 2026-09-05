@@ -76,15 +76,29 @@ const server = http.createServer(async (req, res) => {
     if (pathname === '/health') return send(res, 200, { ok: true, phase: 40, store: 'json-file' });
 
     // Auth
+    function ensureFamilyCode(parent, db) {
+      if (parent.familyCode && /^[0-9]{6,8}$/.test(String(parent.familyCode))) return parent.familyCode;
+      let code;
+      do {
+        code = String(Math.floor(10000000 + Math.random() * 90000000));
+      } while (db.parents.some(p => p.familyCode === code && p.id !== parent.id));
+      parent.familyCode = code;
+      return code;
+    }
+
     if (pathname === '/auth/register' && req.method === 'POST') {
       const db = load();
       const email = String(body.email || '').trim().toLowerCase();
       if (!email || String(body.password || '').length < 4) return send(res, 400, { error: 'email/password required' });
       if (db.parents.find(p => p.email === email)) return send(res, 409, { error: 'email exists' });
       const st = token();
-      db.parents.push({ id: rid(), email, passwordHash: hash(body.password), sessionToken: st, createdAt: now() });
+      let familyCode;
+      do {
+        familyCode = String(Math.floor(10000000 + Math.random() * 90000000));
+      } while (db.parents.some(p => p.familyCode === familyCode));
+      db.parents.push({ id: rid(), email, passwordHash: hash(body.password), sessionToken: st, familyCode, createdAt: now() });
       save(db);
-      return send(res, 200, { sessionToken: st, email });
+      return send(res, 200, { sessionToken: st, email, familyCode });
     }
     if (pathname === '/auth/login' && req.method === 'POST') {
       const db = load();
@@ -92,32 +106,82 @@ const server = http.createServer(async (req, res) => {
       const row = db.parents.find(p => p.email === email && p.passwordHash === hash(body.password || ''));
       if (!row) return send(res, 401, { error: 'invalid credentials' });
       row.sessionToken = token();
+      const familyCode = ensureFamilyCode(row, db);
       save(db);
-      return send(res, 200, { sessionToken: row.sessionToken, email: row.email });
+      return send(res, 200, { sessionToken: row.sessionToken, email: row.email, familyCode });
     }
     if (pathname === '/auth/logout' && req.method === 'POST') {
       const p = parentOf(body, q, req.headers);
       if (p) { const db = load(); const x = db.parents.find(a => a.id === p.id); if (x) x.sessionToken = null; save(db); }
       return send(res, 200, { ok: true });
     }
+    if (pathname === '/auth/me' && req.method === 'GET') {
+      const p = parentOf(body, q, req.headers);
+      if (!p) return send(res, 401, { error: 'unauthorized' });
+      const db = load();
+      const row = db.parents.find(a => a.id === p.id);
+      if (!row) return send(res, 401, { error: 'unauthorized' });
+      const familyCode = ensureFamilyCode(row, db);
+      save(db);
+      return send(res, 200, { email: row.email, familyCode });
+    }
 
     // Pairing
+    // Permanent family code: child enters parent's fixed familyCode → new device is created under that parent.
+    // Old one-time pairingCode still works for backward compatibility.
     if (pathname === '/pair/create' && req.method === 'POST') {
       const p = parentOf(body, q, req.headers);
       if (!p) return send(res, 401, { error: 'unauthorized' });
       const db = load();
-      let pairingCode = String(body.code || body.pairingCode || '').trim();
-      if (!/^[0-9]{6,8}$/.test(pairingCode)) pairingCode = String(Math.floor(10000000 + Math.random() * 90000000));
-      db.devices = db.devices.filter(d => !(d.parentId === p.id && !d.childToken));
-      const device = { id: rid(), parentId: p.id, deviceId: 'dev_' + rid(), name: body.name || 'Child', pairingCode, childToken: null, online: 0, battery: -1, charging: 0, lastSeen: null, lat: null, lon: null, settings: {} };
-      db.devices.push(device);
+      const row = db.parents.find(a => a.id === p.id);
+      const familyCode = ensureFamilyCode(row, db);
       save(db);
-      return send(res, 200, { ok: true, pairingCode, code: pairingCode, deviceId: device.deviceId });
+      return send(res, 200, { ok: true, pairingCode: familyCode, code: familyCode, familyCode, permanent: true });
     }
     if (pathname === '/pair/claim' && req.method === 'POST') {
       const db = load();
       const code = String(body.pairingCode || body.code || '').trim();
-      const name = String(body.name || body.childName || 'Child').trim();
+      const name = String(body.name || body.childName || 'Child').trim() || 'Child';
+      if (!/^[0-9]{6,8}$/.test(code)) return send(res, 400, { error: 'invalid code format', paired: false });
+
+      // 1) Permanent family code (preferred, never expires, reusable for many children)
+      let parent = db.parents.find(p => p.familyCode === code);
+      if (parent) {
+        const incomingId = body.deviceId ? String(body.deviceId) : null;
+        // Same phone re-pair: update existing device instead of creating duplicate
+        let device = null;
+        if (incomingId) {
+          device = db.devices.find(d => d.parentId === parent.id && d.deviceId === incomingId);
+        }
+        if (device) {
+          device.childToken = token();
+          device.name = name;
+          device.pairingCode = null;
+          device.online = 1;
+          device.lastSeen = now();
+        } else {
+          device = {
+            id: rid(),
+            parentId: parent.id,
+            deviceId: incomingId || ('dev_' + rid()),
+            name: name,
+            pairingCode: null,
+            childToken: token(),
+            online: 1,
+            battery: -1,
+            charging: 0,
+            lastSeen: now(),
+            lat: null,
+            lon: null,
+            settings: {}
+          };
+          db.devices.push(device);
+        }
+        save(db);
+        return send(res, 200, { paired: true, childToken: device.childToken, deviceId: device.deviceId, name: device.name, permanent: true });
+      }
+
+      // 2) Legacy one-time pairing code
       const row = db.devices.find(d => d.pairingCode === code && !d.childToken);
       if (!row) return send(res, 404, { error: 'invalid or used code', paired: false });
       row.childToken = token();
@@ -134,7 +198,7 @@ const server = http.createServer(async (req, res) => {
       const p = parentOf(body, q, req.headers);
       if (!p) return send(res, 401, { error: 'unauthorized' });
       return send(res, 200, { devices: load().devices.filter(d => d.parentId === p.id).map(d => ({
-        deviceId: d.deviceId, name: d.name, online: d.online, battery: d.battery, charging: d.charging, lastSeen: d.lastSeen, lat: d.lat, lon: d.lon
+        deviceId: d.deviceId, name: d.name, childName: d.name, online: d.online, battery: d.battery, charging: d.charging, lastSeen: d.lastSeen, lat: d.lat, lon: d.lon
       })) });
     }
     if (pathname === '/device/remove' && req.method === 'POST') {
