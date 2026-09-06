@@ -15,6 +15,11 @@ const MEDIA = path.join(__dirname, 'media');
 [DATA, MEDIA].forEach(d => { if (!fs.existsSync(d)) fs.mkdirSync(d, { recursive: true }); });
 const DB_FILE = path.join(DATA, 'db.json');
 
+// In-memory hot path for LIVE streams (audio/camera/screen).
+// Avoids disk read on every parent poll → much lower latency, closer to AirDroid Kids live voice.
+// key = deviceId + '|' + kindUpper  →  { id, kind, b64, createdAt, createdMs }
+const liveLatest = new Map();
+
 function load() {
   let db;
   try { db = JSON.parse(fs.readFileSync(DB_FILE, 'utf8')); }
@@ -745,22 +750,40 @@ const server = http.createServer(async (req, res) => {
       const d = childOf(body, q, req.headers); if (!d) return send(res, 401, { error: 'unauthorized' });
       const kind = body.kind || 'SCREEN';
       const b64 = body.data || body.base64 || '';
+      const kindU = String(kind).toUpperCase();
+      const isLive = kindU.indexOf('LIVE_') === 0 || kindU === 'AUDIO' || kindU === 'CAMERA' || kindU === 'SCREEN';
+      const isAudio = kindU.indexOf('AUDIO') >= 0;
       let filePath = null;
-      if (b64 && String(b64).length > 100) {
-        const buf = Buffer.from(String(b64).replace(/^data:[^;]+;base64,/, ''), 'base64');
-        const ext = (String(kind).toUpperCase().indexOf('AUDIO') >= 0) ? '.m4a' : '.jpg';
-        filePath = path.join(MEDIA, d.deviceId + '_' + Date.now() + '_' + kind + ext);
-        fs.writeFileSync(filePath, buf);
+      const id = rid();
+      const createdAt = now();
+      const createdMs = Date.now();
+      if (b64 && String(b64).length > 50) {
+        // Always keep in-memory for LIVE (fast parent poll — AirDroid-like)
+        if (isLive) {
+          const key = d.deviceId + '|' + (isAudio ? 'LIVE_AUDIO' : kindU);
+          liveLatest.set(key, { id, kind, b64: String(b64), createdAt, createdMs });
+          // Also set generic LIVE_AUDIO key for audio variants
+          if (isAudio) liveLatest.set(d.deviceId + '|LIVE_AUDIO', { id, kind, b64: String(b64), createdAt, createdMs });
+        }
+        // Disk write only for non-tiny payloads; skip disk for pure live audio PCM to reduce latency & I/O
+        if (!isAudio || String(b64).length > 200000) {
+          try {
+            const buf = Buffer.from(String(b64).replace(/^data:[^;]+;base64,/, ''), 'base64');
+            const ext = isAudio ? '.pcm' : '.jpg';
+            filePath = path.join(MEDIA, d.deviceId + '_' + createdMs + '_' + kind + ext);
+            fs.writeFileSync(filePath, buf);
+          } catch (e) { /* ignore disk errors for live */ }
+        }
       }
       const db = load();
-      const row = { id: rid(), deviceId: d.deviceId, kind, requestId: body.requestId || 0, path: filePath, createdAt: now(), createdMs: Date.now() };
+      const row = { id, deviceId: d.deviceId, kind, requestId: body.requestId || 0, path: filePath, createdAt, createdMs };
       db.media.push(row);
       // LIVE sessions must stay APPROVED so Parent can keep polling frames
       if (body.requestId) {
         const pr = db.privacy.find(r => String(r.id) === String(body.requestId));
         if (pr) {
           const k = String(kind || '');
-          if (k.indexOf('LIVE_') === 0) {
+          if (k.indexOf('LIVE_') === 0 || isLive) {
             pr.status = 'APPROVED';
             pr.lastFrameAt = now();
           } else {
@@ -780,8 +803,24 @@ const server = http.createServer(async (req, res) => {
     if (pathname === '/media/latest' && req.method === 'GET') {
       const p = parentOf(body, q, req.headers); if (!p) return send(res, 401, { error: 'unauthorized' });
       const kind = (q.kind || 'SCREEN').toUpperCase();
+      const deviceId = q.deviceId || '';
+      // Fast path: in-memory live buffer (no disk) — critical for continuous voice
+      const memKeys = [
+        deviceId + '|' + kind,
+        deviceId + '|LIVE_AUDIO',
+        deviceId + '|' + kind.replace(/^LIVE_/, ''),
+      ];
+      for (const k of memKeys) {
+        const mem = liveLatest.get(k);
+        if (mem && mem.b64 && mem.b64.length > 50) {
+          // Prefer memory if fresh (< 4s)
+          if (Date.now() - (mem.createdMs || 0) < 4000) {
+            return send(res, 200, { media: { id: mem.id, kind: mem.kind, body: mem.b64, base64: mem.b64, createdAt: mem.createdAt, createdMs: mem.createdMs } });
+          }
+        }
+      }
       const list = load().media.filter(m => {
-        if (m.deviceId !== q.deviceId) return false;
+        if (m.deviceId !== deviceId) return false;
         const mk = String(m.kind || '').toUpperCase();
         return mk === kind || mk.indexOf(kind) >= 0 || kind.indexOf(mk) >= 0
           || (kind.indexOf('CAMERA') >= 0 && mk.indexOf('CAMERA') >= 0)
@@ -789,9 +828,17 @@ const server = http.createServer(async (req, res) => {
           || (kind.indexOf('AUDIO') >= 0 && mk.indexOf('AUDIO') >= 0);
       });
       const row = list[list.length - 1];
-      if (!row || !row.path || !fs.existsSync(row.path)) return send(res, 200, { media: null });
-      const b64 = fs.readFileSync(row.path).toString('base64');
-      return send(res, 200, { media: { id: row.id, kind: row.kind, body: b64, base64: b64, createdAt: row.createdAt } });
+      if (!row) return send(res, 200, { media: null });
+      if (row.path && fs.existsSync(row.path)) {
+        const b64 = fs.readFileSync(row.path).toString('base64');
+        return send(res, 200, { media: { id: row.id, kind: row.kind, body: b64, base64: b64, createdAt: row.createdAt, createdMs: row.createdMs || Date.parse(row.createdAt) || 0 } });
+      }
+      // fallback memory even if slightly stale
+      for (const k of memKeys) {
+        const mem = liveLatest.get(k);
+        if (mem && mem.b64) return send(res, 200, { media: { id: mem.id, kind: mem.kind, body: mem.b64, base64: mem.b64, createdAt: mem.createdAt, createdMs: mem.createdMs } });
+      }
+      return send(res, 200, { media: null });
     }
     if (pathname === '/media/item' && req.method === 'GET') {
       const p = parentOf(body, q, req.headers); if (!p) return send(res, 401, { error: 'unauthorized' });
