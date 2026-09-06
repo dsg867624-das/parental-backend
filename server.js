@@ -619,7 +619,7 @@ const server = http.createServer(async (req, res) => {
       '/driving/event': (db, d, b) => { db.driving.push({ id: rid(), deviceId: d.deviceId, speed: b.speed || 0, lat: b.lat || 0, lon: b.lon || 0, createdAt: now() }); if ((b.speed || 0) >= 25) db.alerts.push({ id: rid(), deviceId: d.deviceId, parentId: d.parentId, type: 'DRIVING', message: 'Driving ~' + b.speed, createdAt: now() }); },
       '/app-health/report': (db, d, b) => { db.appHealth.push({ id: rid(), deviceId: d.deviceId, report: b, createdAt: now() }); },
       '/image-scan/flag': (db, d, b) => { db.imageFlags.push({ id: rid(), deviceId: d.deviceId, source: b.source || '', score: b.score || 0, labels: b.labels || [], createdAt: now() }); db.alerts.push({ id: rid(), deviceId: d.deviceId, parentId: d.parentId, type: 'IMAGE_FLAG', message: 'Sensitive image flag', createdAt: now() }); },
-      '/sos': (db, d, b) => { db.sos.push({ id: rid(), deviceId: d.deviceId, message: b.message || 'SOS', ack: 0, createdAt: now() }); db.alerts.push({ id: rid(), deviceId: d.deviceId, parentId: d.parentId, type: 'SOS', message: b.message || 'SOS', createdAt: now() }); },
+      '/sos': (db, d, b) => { const msg = b.message || b.note || 'SOS from child'; const lat = b.latitude || b.lat || 0; const lon = b.longitude || b.lon || 0; db.sos.push({ id: rid(), deviceId: d.deviceId, message: msg, lat, lon, ack: 0, createdAt: now() }); db.alerts.push({ id: rid(), deviceId: d.deviceId, parentId: d.parentId, type: 'SOS', title: 'SOS ALERT', message: msg + (lat ? (' @ ' + lat + ',' + lon) : ''), createdAt: now(), read: false }); }); db.alerts.push({ id: rid(), deviceId: d.deviceId, parentId: d.parentId, type: 'SOS', title: 'SOS ALERT', message: msg + (lat ? (' @ ' + lat + ',' + lon) : ''), createdAt: now(), read: false }); },
       '/geofence/event': (db, d, b) => { db.alerts.push({ id: rid(), deviceId: d.deviceId, parentId: d.parentId, type: 'GEOFENCE', message: b.message || (b.enter ? 'Entered' : 'Exited'), createdAt: now() }); },
       '/data-usage/update': (db, d, b) => { const day = b.day || now().slice(0, 10); db.dataUsage = db.dataUsage.filter(x => !(x.deviceId === d.deviceId && x.day === day)); db.dataUsage.push({ id: rid(), deviceId: d.deviceId, mobileBytes: b.mobileBytes || 0, wifiBytes: b.wifiBytes || 0, day }); },
       '/usage/update': (db, d, b) => { const day = b.day || now().slice(0, 10); (b.items || []).forEach(it => { db.usage = db.usage.filter(u => !(u.deviceId === d.deviceId && u.day === day && u.packageName === it.packageName)); db.usage.push({ id: rid(), deviceId: d.deviceId, packageName: it.packageName, day, seconds: it.seconds || 0 }); }); },
@@ -774,7 +774,14 @@ const server = http.createServer(async (req, res) => {
     if (pathname === '/media/latest' && req.method === 'GET') {
       const p = parentOf(body, q, req.headers); if (!p) return send(res, 401, { error: 'unauthorized' });
       const kind = (q.kind || 'SCREEN').toUpperCase();
-      const list = load().media.filter(m => m.deviceId === q.deviceId && String(m.kind || '').toUpperCase() === kind);
+      const list = load().media.filter(m => {
+        if (m.deviceId !== q.deviceId) return false;
+        const mk = String(m.kind || '').toUpperCase();
+        return mk === kind || mk.indexOf(kind) >= 0 || kind.indexOf(mk) >= 0
+          || (kind.indexOf('CAMERA') >= 0 && mk.indexOf('CAMERA') >= 0)
+          || (kind.indexOf('SCREEN') >= 0 && mk.indexOf('SCREEN') >= 0)
+          || (kind.indexOf('AUDIO') >= 0 && mk.indexOf('AUDIO') >= 0);
+      });
       const row = list[list.length - 1];
       if (!row || !row.path || !fs.existsSync(row.path)) return send(res, 200, { media: null });
       const b64 = fs.readFileSync(row.path).toString('base64');
