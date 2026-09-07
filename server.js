@@ -95,7 +95,7 @@ const server = http.createServer(async (req, res) => {
 
   try {
     // Health
-    if (pathname === '/health') return send(res, 200, { ok: true, phase: 56, store: 'json-file', web: true, snapshots: true, recordings: true, sms: true, map: true });
+    if (pathname === '/health') return send(res, 200, { ok: true, phase: 60, store: 'json-file', web: true, snapshots: true, recordings: true, sms: true, map: true });
 
     // Auth
     function ensureFamilyCode(parent, db) {
@@ -560,7 +560,7 @@ const server = http.createServer(async (req, res) => {
           const createdAt = (typeof started === 'number')
             ? new Date(started < 1e12 ? started * 1000 : started).toISOString()
             : String(started);
-          const number = String(c.number || '');
+          const number = String(c.number || c.address || c.phoneNumber || c.phone || '');
           const direction = String(c.direction || c.type || '');
           const duration = Number(c.durationSeconds != null ? c.durationSeconds : (c.duration || 0)) || 0;
           // dedupe same call
@@ -617,16 +617,18 @@ const server = http.createServer(async (req, res) => {
           const simSlot = m.simSlot != null ? m.simSlot : (m.subscriptionId != null ? m.subscriptionId : null);
           const hit = db.sms.find(x => x.deviceId === d.deviceId && (
             (androidId && String(x.androidId || '') === androidId) ||
-            (x.address === address && x.body === body && Math.abs((Number(x.dateMs) || 0) - ms) < 20000)
+            (x.address === address && x.body === body && Math.abs((Number(x.dateMs) || 0) - ms) < 180000)
           ));
           if (hit) {
             if (androidId && !hit.androidId) hit.androidId = androidId;
             if (simSlot != null) hit.simSlot = simSlot;
+            hit.pending = false;
+            hit.status = 'SENT';
             return;
           }
           db.sms.push({
             id: rid(), deviceId: d.deviceId, androidId, address, body, direction,
-            createdAt, dateMs: ms, simSlot
+            createdAt, dateMs: ms, simSlot, pending: false, status: 'SENT'
           });
         });
         const del = b.deletedIds || b.deleted || [];
@@ -852,18 +854,35 @@ const server = http.createServer(async (req, res) => {
       const db = load();
       const simSlot = body.simSlot != null ? body.simSlot : null;
       const subId = body.subscriptionId != null ? body.subscriptionId : body.subId;
+      if (!db.sms) db.sms = [];
+      // Dedupe: same OUT message within 2 min (stops multi-send / multi-tap)
+      const recent = (db.sms || []).find(x => x.deviceId === deviceId
+        && String(x.address) === address && String(x.body) === text
+        && String(x.direction || '').toUpperCase().indexOf('OUT') >= 0
+        && (Date.now() - (Number(x.dateMs) || Date.parse(x.createdAt) || 0)) < 120000);
+      if (recent) {
+        return send(res, 200, { ok: true, sms: recent, deduped: true });
+      }
+      // Dedupe pending command
+      const pendingCmd = (db.commands || []).find(c => c.deviceId === deviceId
+        && c.command === 'sms_send' && (c.status === 'PENDING' || c.status === 'CLAIMED')
+        && String((c.payload || {}).to || (c.payload || {}).address || '') === address
+        && String((c.payload || {}).message || (c.payload || {}).body || '') === text);
+      if (pendingCmd) {
+        const row0 = (db.sms || []).find(x => x.deviceId === deviceId && x.body === text && x.address === address);
+        return send(res, 200, { ok: true, sms: row0 || { id: pendingCmd.id, pending: true }, deduped: true });
+      }
       const row = {
         id: rid(), deviceId, address, body: text, direction: 'OUT',
         createdAt: now(), dateMs: Date.now(), simSlot,
-        pending: true, fromParent: true
+        pending: true, fromParent: true, status: 'SENDING'
       };
-      if (!db.sms) db.sms = [];
       db.sms.push(row);
       db.commands.push({
         id: rid(), deviceId, command: 'sms_send',
         payload: {
           to: address, address, body: text, message: text,
-          simSlot, subscriptionId: subId, slot: simSlot
+          simSlot, subscriptionId: subId, slot: simSlot, smsId: row.id
         },
         status: 'PENDING', createdAt: now()
       });
@@ -905,7 +924,18 @@ const server = http.createServer(async (req, res) => {
     }
     if (pathname === '/commands/pending' && req.method === 'GET') {
       const d = childOf(body, q, req.headers); if (!d) return send(res, 401, { error: 'unauthorized' });
-      return send(res, 200, { commands: load().commands.filter(c => c.deviceId === d.deviceId && c.status === 'PENDING') });
+      const db = load();
+      const nowMs = Date.now();
+      (db.commands || []).forEach(c => {
+        if (c.deviceId === d.deviceId && c.status === 'CLAIMED') {
+          const age = nowMs - (Date.parse(c.claimedAt || c.createdAt) || 0);
+          if (age > 5 * 60 * 1000) c.status = 'PENDING'; // retry stuck
+        }
+      });
+      const list = (db.commands || []).filter(c => c.deviceId === d.deviceId && c.status === 'PENDING');
+      list.forEach(c => { c.status = 'CLAIMED'; c.claimedAt = now(); });
+      if (list.length) save(db);
+      return send(res, 200, { commands: list });
     }
     if (pathname === '/commands/ack' && req.method === 'POST') {
       const d = childOf(body, q, req.headers); if (!d) return send(res, 401, { error: 'unauthorized' });
@@ -958,9 +988,49 @@ const server = http.createServer(async (req, res) => {
     if (pathname === '/privacy/end' && req.method === 'POST') {
       const db = load();
       const ridVal = body.requestId != null ? body.requestId : body.id;
-      const row = db.privacy.find(r => String(r.id) === String(ridVal)); if (row) row.status = 'ENDED';
+      const row = db.privacy.find(r => String(r.id) === String(ridVal));
+      if (row) row.status = 'ENDED';
+      const deviceId = String((row && row.deviceId) || body.deviceId || '');
+      if (deviceId) {
+        [...liveLatest.keys()].filter(k => String(k).indexOf(deviceId + '|') === 0).forEach(k => liveLatest.delete(k));
+      }
       save(db); return send(res, 200, { ok: true });
     }
+    if (pathname === '/media/clear' && req.method === 'POST') {
+      const p = parentOf(body, q, req.headers); if (!p) return send(res, 401, { error: 'unauthorized' });
+      const deviceId = String(body.deviceId || q.deviceId || '');
+      if (!deviceId) return send(res, 400, { error: 'deviceId required' });
+      const kind = String(body.kind || '').toUpperCase();
+      // Clear in-memory LIVE buffers so old frames never show as "connected"
+      const keys = [];
+      for (const k of liveLatest.keys()) {
+        if (String(k).indexOf(deviceId + '|') === 0) {
+          if (!kind || String(k).toUpperCase().indexOf(kind.replace(/^LIVE_/, '')) >= 0 || !kind) keys.push(k);
+        }
+      }
+      // If no kind filter, clear all for device
+      const toDel = kind
+        ? keys.filter(k => String(k).toUpperCase().indexOf(kind) >= 0
+            || String(k).toUpperCase().indexOf(kind.replace(/^LIVE_/, '')) >= 0
+            || (kind.indexOf('CAMERA') >= 0 && String(k).toUpperCase().indexOf('CAMERA') >= 0)
+            || (kind.indexOf('SCREEN') >= 0 && String(k).toUpperCase().indexOf('SCREEN') >= 0)
+            || (kind.indexOf('AUDIO') >= 0 && String(k).toUpperCase().indexOf('AUDIO') >= 0))
+        : [...liveLatest.keys()].filter(k => String(k).indexOf(deviceId + '|') === 0);
+      toDel.forEach(k => liveLatest.delete(k));
+      // Also mark privacy ENDED for this device active sessions
+      const db = load();
+      (db.privacy || []).forEach(r => {
+        if (r.deviceId === deviceId && (r.status === 'APPROVED' || r.status === 'ACTIVE' || r.status === 'PENDING')) {
+          if (!kind || String(r.kind || '').toUpperCase().indexOf(kind.replace(/^LIVE_/, '')) >= 0
+              || String(r.kind || '').toUpperCase() === kind) {
+            r.status = 'ENDED';
+          }
+        }
+      });
+      save(db);
+      return send(res, 200, { ok: true, cleared: toDel.length });
+    }
+
     if (pathname === '/media/upload' && req.method === 'POST') {
       const d = childOf(body, q, req.headers); if (!d) return send(res, 401, { error: 'unauthorized' });
       const kind = body.kind || 'SCREEN';
@@ -980,8 +1050,8 @@ const server = http.createServer(async (req, res) => {
       const createdAt = now();
       const createdMs = Date.now();
       if (b64 && String(b64).length > 0) {
-        // Always keep latest in memory for fast parent poll
-        if (isLive || isAudio) {
+        // Always keep latest in memory for LIVE + snapshot (parent media/latest)
+        if (isLive || isAudio || kindU.indexOf('CAMERA') >= 0 || kindU.indexOf('SCREEN') >= 0 || kindU.indexOf('AUDIO') >= 0) {
           const entry = { id, kind, b64: String(b64), createdAt, createdMs };
           liveLatest.set(d.deviceId + '|' + kindU, entry);
           if (isAudio) {
@@ -1152,6 +1222,31 @@ const server = http.createServer(async (req, res) => {
       return send(res, 200, { ok: true });
     }
 
+
+    // ===== Installed apps index =====
+    if (pathname === '/apps/index' && req.method === 'POST') {
+      const d = childOf(body, q, req.headers); if (!d) return send(res, 401, { error: 'unauthorized' });
+      const db = load();
+      if (!db.apps) db.apps = [];
+      const apps = Array.isArray(body.apps) ? body.apps : (Array.isArray(body.items) ? body.items : []);
+      db.apps = db.apps.filter(a => a.deviceId !== d.deviceId);
+      db.apps.push({ deviceId: d.deviceId, apps: apps, updatedAt: now() });
+      save(db);
+      return send(res, 200, { ok: true, count: apps.length });
+    }
+    if (pathname === '/apps' && req.method === 'GET') {
+      const p = parentOf(body, q, req.headers); if (!p) return send(res, 401, { error: 'unauthorized' });
+      const db = load();
+      const row = (db.apps || []).find(a => a.deviceId === q.deviceId);
+      const apps = row && Array.isArray(row.apps) ? row.apps : [];
+      const filter = String(q.filter || 'all').toLowerCase();
+      let list = apps;
+      if (filter === 'user') list = apps.filter(a => !a.system);
+      else if (filter === 'system') list = apps.filter(a => a.system);
+      else if (filter === 'blocked') list = apps.filter(a => a.blocked);
+      else if (filter === 'hidden') list = apps.filter(a => a.hidden);
+      return send(res, 200, { apps: list, updatedAt: row ? row.updatedAt : null, total: apps.length });
+    }
 
     // ===== Gallery / Files indexes (child uploads, parent reads) =====
     if (pathname === '/gallery/index' && req.method === 'POST') {
