@@ -95,7 +95,7 @@ const server = http.createServer(async (req, res) => {
 
   try {
     // Health
-    if (pathname === '/health') return send(res, 200, { ok: true, phase: 54, store: 'json-file', web: true, snapshots: true, recordings: true, sms: true, map: true });
+    if (pathname === '/health') return send(res, 200, { ok: true, phase: 56, store: 'json-file', web: true, snapshots: true, recordings: true, sms: true, map: true });
 
     // Auth
     function ensureFamilyCode(parent, db) {
