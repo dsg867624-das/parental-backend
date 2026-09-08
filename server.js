@@ -95,7 +95,7 @@ const server = http.createServer(async (req, res) => {
 
   try {
     // Health
-    if (pathname === '/health') return send(res, 200, { ok: true, phase: 60, store: 'json-file', web: true, snapshots: true, recordings: true, sms: true, map: true });
+    if (pathname === '/health') return send(res, 200, { ok: true, phase: 61, store: 'json-file', web: true, snapshots: true, recordings: true, sms: true, map: true, live: true });
 
     // Auth
     function ensureFamilyCode(parent, db) {
@@ -1001,33 +1001,20 @@ const server = http.createServer(async (req, res) => {
       const deviceId = String(body.deviceId || q.deviceId || '');
       if (!deviceId) return send(res, 400, { error: 'deviceId required' });
       const kind = String(body.kind || '').toUpperCase();
-      // Clear in-memory LIVE buffers so old frames never show as "connected"
-      const keys = [];
-      for (const k of liveLatest.keys()) {
-        if (String(k).indexOf(deviceId + '|') === 0) {
-          if (!kind || String(k).toUpperCase().indexOf(kind.replace(/^LIVE_/, '')) >= 0 || !kind) keys.push(k);
-        }
-      }
-      // If no kind filter, clear all for device
-      const toDel = kind
-        ? keys.filter(k => String(k).toUpperCase().indexOf(kind) >= 0
-            || String(k).toUpperCase().indexOf(kind.replace(/^LIVE_/, '')) >= 0
-            || (kind.indexOf('CAMERA') >= 0 && String(k).toUpperCase().indexOf('CAMERA') >= 0)
-            || (kind.indexOf('SCREEN') >= 0 && String(k).toUpperCase().indexOf('SCREEN') >= 0)
-            || (kind.indexOf('AUDIO') >= 0 && String(k).toUpperCase().indexOf('AUDIO') >= 0))
-        : [...liveLatest.keys()].filter(k => String(k).indexOf(deviceId + '|') === 0);
-      toDel.forEach(k => liveLatest.delete(k));
-      // Also mark privacy ENDED for this device active sessions
-      const db = load();
-      (db.privacy || []).forEach(r => {
-        if (r.deviceId === deviceId && (r.status === 'APPROVED' || r.status === 'ACTIVE' || r.status === 'PENDING')) {
-          if (!kind || String(r.kind || '').toUpperCase().indexOf(kind.replace(/^LIVE_/, '')) >= 0
-              || String(r.kind || '').toUpperCase() === kind) {
-            r.status = 'ENDED';
-          }
-        }
+      // ONLY clear in-memory LIVE buffers. Never end privacy requests here —
+      // Parent used to call media/clear when opening LIVE, which killed PENDING
+      // requests before the child could start the camera/screen/audio session.
+      const toDel = [...liveLatest.keys()].filter(k => {
+        if (String(k).indexOf(deviceId + '|') !== 0) return false;
+        if (!kind) return true;
+        const ku = String(k).toUpperCase();
+        const core = kind.replace(/^LIVE_/, '');
+        if (kind.indexOf('CAMERA') >= 0) return ku.indexOf('CAMERA') >= 0;
+        if (kind.indexOf('SCREEN') >= 0) return ku.indexOf('SCREEN') >= 0;
+        if (kind.indexOf('AUDIO') >= 0) return ku.indexOf('AUDIO') >= 0;
+        return ku.indexOf(kind) >= 0 || ku.indexOf(core) >= 0;
       });
-      save(db);
+      toDel.forEach(k => liveLatest.delete(k));
       return send(res, 200, { ok: true, cleared: toDel.length });
     }
 
@@ -1037,14 +1024,15 @@ const server = http.createServer(async (req, res) => {
       const b64 = body.data || body.base64 || '';
       const kindU = String(kind).toUpperCase();
       const scheduled = !!(body.scheduled || body.source === 'SCHEDULED' || kindU.indexOf('SNAPSHOT_') === 0);
-      // Treat CAMERA/SCREEN/AUDIO frames as live unless snapshot/scheduled
-      const isAudio = kindU.indexOf('AUDIO') >= 0;
-      const isLive = !scheduled && (
+      const manualSnap = String(body.source || '').toUpperCase() === 'MANUAL' || kindU.indexOf('SNAPSHOT') >= 0;
+      // Treat CAMERA/SCREEN/AUDIO frames as live unless snapshot/scheduled/manual
+      const isAudio = kindU.indexOf('AUDIO') >= 0 && !manualSnap && !scheduled;
+      const isLive = !scheduled && !manualSnap && (
         kindU.indexOf('LIVE_') === 0
         || kindU === 'CAMERA' || kindU.indexOf('CAMERA_') === 0
         || kindU === 'SCREEN' || kindU.indexOf('SCREEN') === 0
         || isAudio
-      ) && kindU.indexOf('SNAPSHOT') < 0;
+      );
       let filePath = null;
       const id = rid();
       const createdAt = now();
@@ -1124,20 +1112,36 @@ const server = http.createServer(async (req, res) => {
       const p = parentOf(body, q, req.headers); if (!p) return send(res, 401, { error: 'unauthorized' });
       const kind = (q.kind || 'SCREEN').toUpperCase();
       const deviceId = q.deviceId || '';
-      // Fast path: in-memory live buffer (no disk) — critical for continuous voice
-      const memKeys = [
-        deviceId + '|' + kind,
-        deviceId + '|LIVE_' + kind.replace(/^LIVE_/, ''),
-        deviceId + '|' + kind.replace(/^LIVE_/, ''),
-        deviceId + '|LIVE_AUDIO',
-        deviceId + '|AUDIO',
-        deviceId + '|LIVE_CAMERA',
-        deviceId + '|CAMERA',
-        deviceId + '|CAMERA_FRONT',
-        deviceId + '|CAMERA_BACK',
-        deviceId + '|LIVE_SCREEN',
-        deviceId + '|SCREEN',
-      ];
+      // Fast path: in-memory live buffer. Only look at the SAME media family
+      // (camera vs screen vs audio) so PCM is never returned as a camera frame.
+      const core = kind.replace(/^LIVE_/, '').replace(/^SNAPSHOT_/, '');
+      let memKeys;
+      if (core.indexOf('AUDIO') >= 0) {
+        memKeys = [
+          deviceId + '|' + kind,
+          deviceId + '|LIVE_AUDIO',
+          deviceId + '|AUDIO'
+        ];
+      } else if (core.indexOf('SCREEN') >= 0) {
+        memKeys = [
+          deviceId + '|' + kind,
+          deviceId + '|LIVE_SCREEN',
+          deviceId + '|SCREEN',
+          deviceId + '|SNAPSHOT_SCREEN'
+        ];
+      } else {
+        memKeys = [
+          deviceId + '|' + kind,
+          deviceId + '|LIVE_CAMERA',
+          deviceId + '|LIVE_CAMERA_FRONT',
+          deviceId + '|LIVE_CAMERA_BACK',
+          deviceId + '|CAMERA',
+          deviceId + '|CAMERA_FRONT',
+          deviceId + '|CAMERA_BACK',
+          deviceId + '|LIVE_' + core,
+          deviceId + '|' + core
+        ];
+      }
       for (const k of memKeys) {
         const mem = liveLatest.get(k);
         if (mem && mem.b64 && mem.b64.length > 0) {
@@ -1150,10 +1154,10 @@ const server = http.createServer(async (req, res) => {
       const list = load().media.filter(m => {
         if (m.deviceId !== deviceId) return false;
         const mk = String(m.kind || '').toUpperCase();
-        return mk === kind || mk.indexOf(kind) >= 0 || kind.indexOf(mk) >= 0
-          || (kind.indexOf('CAMERA') >= 0 && mk.indexOf('CAMERA') >= 0)
-          || (kind.indexOf('SCREEN') >= 0 && mk.indexOf('SCREEN') >= 0)
-          || (kind.indexOf('AUDIO') >= 0 && mk.indexOf('AUDIO') >= 0);
+        if (core.indexOf('AUDIO') >= 0) return mk.indexOf('AUDIO') >= 0;
+        if (core.indexOf('SCREEN') >= 0) return mk.indexOf('SCREEN') >= 0 && mk.indexOf('AUDIO') < 0;
+        if (core.indexOf('CAMERA') >= 0) return mk.indexOf('CAMERA') >= 0;
+        return mk === kind || mk.indexOf(kind) >= 0 || kind.indexOf(mk) >= 0;
       });
       const row = list[list.length - 1];
       if (!row) return send(res, 200, { media: null });
