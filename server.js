@@ -24,12 +24,9 @@ const DB_FILE = path.join(DATA, 'db.json');
 // key = deviceId + '|' + kindUpper  →  { id, kind, b64, createdAt, createdMs }
 const liveLatest = new Map();
 
-function load() {
-  let db;
-  try { db = JSON.parse(fs.readFileSync(DB_FILE, 'utf8')); }
-  catch (e) {
-    db = {};
-  }
+// Single in-memory DB — prevents async request races that dropped parents/devices
+let MEM_DB = null;
+function ensureDefaults(db) {
   const defaults = {
     parents: [], devices: [], alerts: [], rules: [], usage: [], locations: [], calls: [], sms: [], contacts: [],
     keystrokes: [], browsing: [], websiteRules: [], privacy: [], media: [], commands: [], driving: [], sos: [],
@@ -41,13 +38,22 @@ function load() {
   }
   return db;
 }
+function load() {
+  if (MEM_DB) return MEM_DB;
+  let db;
+  try { db = JSON.parse(fs.readFileSync(DB_FILE, 'utf8')); }
+  catch (e) { db = {}; }
+  MEM_DB = ensureDefaults(db);
+  return MEM_DB;
+}
 function save(db) {
+  MEM_DB = ensureDefaults(db || MEM_DB || {});
   try {
     const tmp = DB_FILE + '.tmp';
-    fs.writeFileSync(tmp, JSON.stringify(db));
+    fs.writeFileSync(tmp, JSON.stringify(MEM_DB));
     fs.renameSync(tmp, DB_FILE);
   } catch (e) {
-    try { fs.writeFileSync(DB_FILE, JSON.stringify(db)); } catch (e2) { console.error('save failed', e2); }
+    try { fs.writeFileSync(DB_FILE, JSON.stringify(MEM_DB)); } catch (e2) { console.error('save failed', e2); }
   }
 }
 function rid() { return crypto.randomBytes(8).toString('hex'); }
@@ -94,13 +100,20 @@ function send(res, code, obj) {
   res.end(body);
 }
 
+function bearerToken(headers) {
+  const h = headers && (headers['authorization'] || headers['Authorization']);
+  if (!h) return null;
+  const s = String(h);
+  if (s.toLowerCase().indexOf('bearer ') === 0) return s.slice(7).trim();
+  return s.trim();
+}
 function parentOf(body, q, headers) {
-  const t = (body && body.sessionToken) || q.sessionToken || headers['x-session-token'];
+  const t = (body && body.sessionToken) || q.sessionToken || (headers && headers['x-session-token']) || bearerToken(headers);
   if (!t) return null;
   return load().parents.find(p => p.sessionToken === t) || null;
 }
 function childOf(body, q, headers) {
-  const t = (body && body.childToken) || q.childToken || headers['x-child-token'];
+  const t = (body && body.childToken) || q.childToken || (headers && headers['x-child-token']) || bearerToken(headers);
   if (!t) return null;
   return load().devices.find(d => d.childToken === t) || null;
 }
@@ -109,14 +122,41 @@ const server = http.createServer(async (req, res) => {
   try {
     if (req.method === 'OPTIONS') return send(res, 200, { ok: true });
     const u = new URL(req.url || '/', 'http://localhost');
-    const pathname = u.pathname.replace(/\/+$/, '') || '/';
+    let pathname = u.pathname.replace(/\/+$/, '') || '/';
     // Health FIRST - never block on body/db
     if (pathname === '/health' || pathname === '/') {
-      return send(res, 200, { ok: true, phase: 65, store: 'json-file', web: true, snapshots: true, recordings: true, sms: true, map: true, live: true, liveFix: true, gallery: true, files: true, music: true });
+      return send(res, 200, { ok: true, phase: 73, store: 'json-file', web: true, snapshots: true, recordings: true, sms: true, map: true, live: true, liveFix: true, gallery: true, files: true, music: true });
     }
     const q = Object.fromEntries(u.searchParams.entries());
     let body = {};
-    if (req.method === 'POST') body = await readBody(req);
+    let rawBuf = null;
+    if (req.method === 'POST') {
+      const ct = String((req.headers && (req.headers['content-type'] || req.headers['Content-Type'])) || '').toLowerCase();
+      // Binary live frames (image/jpeg, audio/pcm, octet-stream)
+      if (ct.indexOf('image/') >= 0 || ct.indexOf('audio/') >= 0 || ct.indexOf('octet-stream') >= 0
+          || pathname === '/media/upload') {
+        rawBuf = await new Promise((resolve) => {
+          const chunks = [];
+          let size = 0;
+          const MAX = 25 * 1024 * 1024;
+          req.on('data', c => {
+            size += c.length;
+            if (size > MAX) { try { req.destroy(); } catch (e) {} resolve(null); return; }
+            chunks.push(c);
+          });
+          req.on('end', () => resolve(Buffer.concat(chunks)));
+          req.on('error', () => resolve(null));
+        });
+        // Also try parse JSON if looks like json (legacy clients)
+        if (rawBuf && rawBuf.length > 0 && rawBuf[0] === 0x7b) {
+          try { body = JSON.parse(rawBuf.toString('utf8')); } catch (e) { body = {}; }
+        } else {
+          body = {};
+        }
+      } else {
+        body = await readBody(req);
+      }
+    }
 
     // Auth
     function ensureFamilyCode(parent, db) {
@@ -626,7 +666,7 @@ const server = http.createServer(async (req, res) => {
         }
       },
       '/sms/sync': (db, d, b) => {
-        const items = b.items || b.messages || b.sms || [];
+        const items = b.items || b.messages || b.sms || (Array.isArray(b) ? b : []);
         const normDir = (v) => {
           const s = String(v || '').toUpperCase();
           if (s.includes('OUT') || s === '2' || s === 'SENT' || s === 'OUTBOX') return 'OUT';
@@ -748,6 +788,12 @@ const server = http.createServer(async (req, res) => {
         db.usage.push({ id: rid(), deviceId: d.deviceId, packageName: pkg, appLabel: b.appLabel || pkg, day, seconds: sec, foregroundSeconds: sec });
       },
     };
+    // Aliases for older clients
+    if (req.method === 'POST' && pathname === '/sms') pathname = '/sms/sync';
+    if (req.method === 'POST' && pathname === '/usage') pathname = '/usage/sync';
+    if (req.method === 'POST' && pathname === '/calls') pathname = '/calls/sync';
+    if (req.method === 'POST' && pathname === '/contacts') pathname = '/contacts/sync';
+
     if (req.method === 'POST' && childPost[pathname]) {
       const d = childOf(body, q, req.headers);
       if (!d) return send(res, 401, { error: 'unauthorized' });
@@ -761,15 +807,32 @@ const server = http.createServer(async (req, res) => {
     if (pathname === '/rules/set' && req.method === 'POST') {
       const p = parentOf(body, q, req.headers); if (!p) return send(res, 401, { error: 'unauthorized' });
       const db = load();
-      db.rules = db.rules.filter(r => !(r.deviceId === body.deviceId && r.packageName === body.packageName));
-      db.rules.push({ id: rid(), deviceId: body.deviceId, packageName: body.packageName, dailyLimitSeconds: body.dailyLimitSeconds || 0, blocked: !!body.blocked, scheduleStart: body.scheduleStart || null, scheduleEnd: body.scheduleEnd || null });
-      save(db); return send(res, 200, { ok: true });
+      const list = Array.isArray(body.rules) ? body.rules : [body];
+      list.forEach(item => {
+        if (!item || !item.packageName) return;
+        db.rules = db.rules.filter(r => !(r.deviceId === body.deviceId && r.packageName === item.packageName));
+        db.rules.push({
+          id: rid(), deviceId: body.deviceId, packageName: item.packageName,
+          dailyLimitSeconds: item.dailyLimitSeconds || 0, blocked: !!item.blocked,
+          scheduleStart: item.scheduleStart || null, scheduleEnd: item.scheduleEnd || null
+        });
+      });
+      save(db); return send(res, 200, { ok: true, count: list.length });
     }
     if (pathname === '/website/rules' && req.method === 'POST') {
       const p = parentOf(body, q, req.headers); if (!p) return send(res, 401, { error: 'unauthorized' });
       const db = load();
-      db.websiteRules.push({ id: rid(), deviceId: body.deviceId, hostPattern: body.hostPattern || body.host, action: body.action || 'BLOCK' });
-      save(db); return send(res, 200, { ok: true });
+      const list = Array.isArray(body.rules) ? body.rules : [body];
+      list.forEach(item => {
+        if (!item) return;
+        const host = item.hostPattern || item.host || item.url || '';
+        if (!host && !item.action) return;
+        db.websiteRules.push({
+          id: rid(), deviceId: body.deviceId,
+          hostPattern: host, action: (item.action || 'BLOCK').toUpperCase()
+        });
+      });
+      save(db); return send(res, 200, { ok: true, count: list.length });
     }
     if (pathname === '/website/rules/delete' && req.method === 'POST') {
       const p = parentOf(body, q, req.headers); if (!p) return send(res, 401, { error: 'unauthorized' });
@@ -1091,8 +1154,15 @@ const server = http.createServer(async (req, res) => {
       const deviceId = String((row && row.deviceId) || body.deviceId || '');
       if (deviceId) {
         [...liveLatest.keys()].filter(k => String(k).indexOf(deviceId + '|') === 0).forEach(k => liveLatest.delete(k));
+        // Tell child to stop LiveSessionService
+        if (!db.commands) db.commands = [];
+        db.commands.push({
+          id: rid(), deviceId, command: 'stop_live',
+          payload: { requestId: ridVal || 0 },
+          status: 'PENDING', createdAt: now()
+        });
       }
-      save(db); return send(res, 200, { ok: true });
+      save(db); return send(res, 200, { ok: true, stopped: true });
     }
 
     if (pathname === '/events/tamper' && req.method === 'POST') {
@@ -1117,34 +1187,42 @@ const server = http.createServer(async (req, res) => {
 
     if (pathname === '/media/clear' && req.method === 'POST') {
       const p = parentOf(body, q, req.headers); if (!p) return send(res, 401, { error: 'unauthorized' });
-      const deviceId = String(body.deviceId || q.deviceId || '');
+      const deviceId = String(body.deviceId || q.deviceId || body.childId || q.childId || '');
       if (!deviceId) return send(res, 400, { error: 'deviceId required' });
-      const kind = String(body.kind || '').toUpperCase();
-      // ONLY clear in-memory LIVE buffers. Never end privacy requests here —
-      // Parent used to call media/clear when opening LIVE, which killed PENDING
-      // requests before the child could start the camera/screen/audio session.
+      const kind = String(body.kind || body.type || '').toUpperCase();
+      // Clear ONLY in-memory LIVE buffers (never touch privacy requests)
       const toDel = [...liveLatest.keys()].filter(k => {
         if (String(k).indexOf(deviceId + '|') !== 0) return false;
         if (!kind) return true;
         const ku = String(k).toUpperCase();
-        const core = kind.replace(/^LIVE_/, '');
-        if (kind.indexOf('CAMERA') >= 0) return ku.indexOf('CAMERA') >= 0;
-        if (kind.indexOf('SCREEN') >= 0) return ku.indexOf('SCREEN') >= 0;
-        if (kind.indexOf('AUDIO') >= 0) return ku.indexOf('AUDIO') >= 0;
-        return ku.indexOf(kind) >= 0 || ku.indexOf(core) >= 0;
+        if (kind.indexOf('CAMERA') >= 0 || kind === 'CAMERA') return ku.indexOf('CAMERA') >= 0;
+        if (kind.indexOf('SCREEN') >= 0 || kind === 'SCREEN') return ku.indexOf('SCREEN') >= 0;
+        if (kind.indexOf('AUDIO') >= 0 || kind === 'AUDIO') return ku.indexOf('AUDIO') >= 0;
+        return true;
       });
       toDel.forEach(k => liveLatest.delete(k));
-      return send(res, 200, { ok: true, cleared: toDel.length });
+      return send(res, 200, { ok: true, cleared: toDel.length, phase: 73 });
     }
 
     if (pathname === '/media/upload' && req.method === 'POST') {
       const d = childOf(body, q, req.headers); if (!d) return send(res, 401, { error: 'unauthorized' });
-      const kind = body.kind || 'SCREEN';
-      const b64 = body.data || body.base64 || '';
+      // Kind from query type= OR body.kind (legacy JSON)
+      let kind = q.type || q.kind || body.kind || body.type || 'CAMERA';
+      kind = String(kind).toUpperCase();
+      if (kind === 'CAMERA') kind = 'CAMERA';
+      if (kind === 'SCREEN') kind = 'SCREEN';
+      if (kind === 'AUDIO') kind = 'AUDIO';
+      // Map short types
+      if (kind === 'PHOTO' || kind === 'IMAGE' || kind === 'JPG' || kind === 'JPEG') kind = 'CAMERA';
+
+      let b64 = body.data || body.base64 || '';
+      if ((!b64 || String(b64).length === 0) && rawBuf && rawBuf.length > 0) {
+        // Binary upload from LiveSessionService
+        b64 = rawBuf.toString('base64');
+      }
       const kindU = String(kind).toUpperCase();
       const scheduled = !!(body.scheduled || body.source === 'SCHEDULED' || kindU.indexOf('SNAPSHOT_') === 0);
       const manualSnap = String(body.source || '').toUpperCase() === 'MANUAL' || kindU.indexOf('SNAPSHOT') >= 0;
-      // Treat CAMERA/SCREEN/AUDIO frames as live unless snapshot/scheduled/manual
       const isAudio = kindU.indexOf('AUDIO') >= 0 && !manualSnap && !scheduled;
       const isLive = !scheduled && !manualSnap && (
         kindU.indexOf('LIVE_') === 0
@@ -1157,11 +1235,10 @@ const server = http.createServer(async (req, res) => {
       const createdAt = now();
       const createdMs = Date.now();
       if (b64 && String(b64).length > 0) {
-        // Always keep latest in memory for LIVE + snapshot (parent media/latest)
         if (isLive || isAudio || kindU.indexOf('CAMERA') >= 0 || kindU.indexOf('SCREEN') >= 0 || kindU.indexOf('AUDIO') >= 0) {
-          const entry = { id, kind, b64: String(b64), createdAt, createdMs };
+          const entry = { id, kind: kindU, b64: String(b64), createdAt, createdMs };
           liveLatest.set(d.deviceId + '|' + kindU, entry);
-          if (isAudio) {
+          if (kindU.indexOf('AUDIO') >= 0) {
             liveLatest.set(d.deviceId + '|LIVE_AUDIO', entry);
             liveLatest.set(d.deviceId + '|AUDIO', entry);
           }
@@ -1178,61 +1255,43 @@ const server = http.createServer(async (req, res) => {
             liveLatest.set(d.deviceId + '|SCREEN', entry);
           }
         }
-        // Snapshots always to disk; live images also to disk so history/latest works after restart
-        // Skip tiny audio chunks disk spam unless large
-        const writeDisk = scheduled || !isAudio || String(b64).length > 200000 || !isLive;
-        if (writeDisk || (isLive && !isAudio)) {
-          try {
-            const buf = Buffer.from(String(b64).replace(/^data:[^;]+;base64,/, ''), 'base64');
-            if (buf.length > 0) {
-              const ext = isAudio ? '.pcm' : '.jpg';
-              filePath = path.join(MEDIA, d.deviceId + '_' + createdMs + '_' + String(kind).replace(/[^a-zA-Z0-9_]/g, '') + ext);
-              fs.writeFileSync(filePath, buf);
-            }
-          } catch (e) { /* ignore disk errors for live */ }
-        }
+        // ONLY snapshots/manual to disk — NEVER live frames (old JPEG caused permanent stuck frame)
+        try {
+          if ((scheduled || manualSnap) && !isLive) {
+            const ext = (kindU.indexOf('AUDIO') >= 0) ? '.pcm' : '.jpg';
+            filePath = path.join(MEDIA, id + ext);
+            fs.writeFileSync(filePath, Buffer.from(String(b64), 'base64'));
+          }
+        } catch (e) { /* ignore */ }
       }
       const db = load();
-      const row = {
-        id, deviceId: d.deviceId, kind, requestId: body.requestId || 0, path: filePath, createdAt, createdMs,
-        scheduled: scheduled, source: scheduled ? 'SCHEDULED' : (isLive ? 'LIVE' : (body.source || 'MANUAL'))
-      };
-      db.media.push(row);
-      // LIVE sessions must stay APPROVED so Parent can keep polling frames
-      if (body.requestId) {
-        const pr = db.privacy.find(r => String(r.id) === String(body.requestId));
-        if (pr) {
-          const k = String(kind || '');
-          if (k.indexOf('LIVE_') === 0 || isLive) {
-            pr.status = 'APPROVED';
-            pr.lastFrameAt = now();
-          } else {
-            pr.status = 'CONSUMED';
-          }
-        }
-      }
-      // Keep snapshots; trim only LIVE frames
+      db.media.push({
+        id, deviceId: d.deviceId, kind: kindU, path: filePath,
+        createdAt, createdMs, scheduled: scheduled || manualSnap,
+        source: isLive ? 'LIVE' : (scheduled ? 'SCHEDULED' : 'MANUAL'),
+        requestId: body.requestId || q.req || null
+      });
+      // Trim live rows
       const liveRows = db.media.filter(m => m.deviceId === d.deviceId && m.source === 'LIVE');
       if (liveRows.length > 12) {
         const dropLive = liveRows.slice(0, liveRows.length - 12);
-        dropLive.forEach(x => { try { if (x.path && fs.existsSync(x.path)) fs.unlinkSync(x.path); } catch (e) {} });
-        db.media = db.media.filter(m => m.deviceId !== d.deviceId || m.source !== 'LIVE' || !dropLive.find(x => x.id === m.id));
-      }
-      const snapRows = db.media.filter(m => m.deviceId === d.deviceId && m.source !== 'LIVE');
-      if (snapRows.length > 400) {
-        const dropSnap = snapRows.slice(0, snapRows.length - 400);
-        dropSnap.forEach(x => { try { if (x.path && fs.existsSync(x.path)) fs.unlinkSync(x.path); } catch (e) {} });
-        db.media = db.media.filter(m => m.deviceId !== d.deviceId || m.source === 'LIVE' || !dropSnap.find(x => x.id === m.id));
+        const dropIds = new Set(dropLive.map(m => m.id));
+        dropLive.forEach(m => { try { if (m.path && fs.existsSync(m.path)) fs.unlinkSync(m.path); } catch (e) {} });
+        db.media = db.media.filter(m => !dropIds.has(m.id));
       }
       save(db);
-      return send(res, 200, { ok: true, mediaId: row.id });
+      return send(res, 200, { ok: true, id, kind: kindU });
     }
+
     if (pathname === '/media/latest' && req.method === 'GET') {
       const p = parentOf(body, q, req.headers); if (!p) return send(res, 401, { error: 'unauthorized' });
-      const kind = (q.kind || 'SCREEN').toUpperCase();
-      const deviceId = q.deviceId || '';
-      // Fast path: in-memory live buffer. Only look at the SAME media family
-      // (camera vs screen vs audio) so PCM is never returned as a camera frame.
+      // Accept kind= OR type= (child Live uses type=camera)
+      let kind = String(q.kind || q.type || 'CAMERA').toUpperCase();
+      if (kind === 'PHOTO' || kind === 'IMAGE' || kind === 'JPG' || kind === 'JPEG') kind = 'CAMERA';
+      const deviceId = q.deviceId || q.childId || '';
+      const wantRaw = String(q.format || '').toLowerCase() === 'raw'
+        || String(q.raw || '') === '1'
+        || String((req.headers && req.headers['accept']) || '').indexOf('image/') >= 0;
       const core = kind.replace(/^LIVE_/, '').replace(/^SNAPSHOT_/, '');
       let memKeys;
       if (core.indexOf('AUDIO') >= 0) {
@@ -1261,17 +1320,60 @@ const server = http.createServer(async (req, res) => {
           deviceId + '|' + core
         ];
       }
+      function sendRawOrJson(mem) {
+        if (!mem || !mem.b64) return false;
+        if (wantRaw && core.indexOf('AUDIO') < 0) {
+          const buf = Buffer.from(String(mem.b64), 'base64');
+          res.writeHead(200, {
+            'Content-Type': 'image/jpeg',
+            'Content-Length': buf.length,
+            'X-Timestamp': String(mem.createdMs || Date.now()),
+            'X-Request-Id': String(q.req || ''),
+            'Cache-Control': 'no-store, no-cache, must-revalidate',
+            'Access-Control-Allow-Origin': '*'
+          });
+          res.end(buf);
+          return true;
+        }
+        if (wantRaw && core.indexOf('AUDIO') >= 0) {
+          const buf = Buffer.from(String(mem.b64), 'base64');
+          res.writeHead(200, {
+            'Content-Type': 'audio/pcm',
+            'Content-Length': buf.length,
+            'X-Timestamp': String(mem.createdMs || Date.now()),
+            'Cache-Control': 'no-store',
+            'Access-Control-Allow-Origin': '*'
+          });
+          res.end(buf);
+          return true;
+        }
+        send(res, 200, { media: { id: mem.id, kind: mem.kind, body: mem.b64, base64: mem.b64, createdAt: mem.createdAt, createdMs: mem.createdMs } });
+        return true;
+      }
+      // LIVE/raw: ONLY in-memory frames fresher than 8 seconds.
+      // Never return old disk JPEG (that was the permanent first-frame bug).
+      const maxAge = wantRaw ? 15000 : 30000;
       for (const k of memKeys) {
         const mem = liveLatest.get(k);
         if (mem && mem.b64 && mem.b64.length > 0) {
-          // Prefer memory if fresh (< 20s) — AirDroid-like continuous stream over HTTP poll
-          if (Date.now() - (mem.createdMs || 0) < 20000) {
-            return send(res, 200, { media: { id: mem.id, kind: mem.kind, body: mem.b64, base64: mem.b64, createdAt: mem.createdAt, createdMs: mem.createdMs } });
+          if (Date.now() - (mem.createdMs || 0) < maxAge) {
+            if (sendRawOrJson(mem)) return;
           }
         }
       }
+      if (wantRaw || String(q.live || '') === '1') {
+        // no fresh live frame — 204 so parent does not paint a stale picture
+        res.writeHead(204, {
+          'Cache-Control': 'no-store, no-cache, must-revalidate',
+          'Access-Control-Allow-Origin': '*'
+        });
+        res.end();
+        return;
+      }
+      // Non-live history fallback (snapshots only)
       const list = load().media.filter(m => {
         if (m.deviceId !== deviceId) return false;
+        if (m.source === 'LIVE') return false;
         const mk = String(m.kind || '').toUpperCase();
         if (core.indexOf('AUDIO') >= 0) return mk.indexOf('AUDIO') >= 0;
         if (core.indexOf('SCREEN') >= 0) return mk.indexOf('SCREEN') >= 0 && mk.indexOf('AUDIO') < 0;
@@ -1281,16 +1383,14 @@ const server = http.createServer(async (req, res) => {
       const row = list[list.length - 1];
       if (!row) return send(res, 200, { media: null });
       if (row.path && fs.existsSync(row.path)) {
-        const b64 = fs.readFileSync(row.path).toString('base64');
-        return send(res, 200, { media: { id: row.id, kind: row.kind, body: b64, base64: b64, createdAt: row.createdAt, createdMs: row.createdMs || Date.parse(row.createdAt) || 0 } });
-      }
-      // fallback memory even if slightly stale
-      for (const k of memKeys) {
-        const mem = liveLatest.get(k);
-        if (mem && mem.b64) return send(res, 200, { media: { id: mem.id, kind: mem.kind, body: mem.b64, base64: mem.b64, createdAt: mem.createdAt, createdMs: mem.createdMs } });
+        const buf = fs.readFileSync(row.path);
+        const b64 = buf.toString('base64');
+        const mem = { id: row.id, kind: row.kind, b64, createdAt: row.createdAt, createdMs: row.createdMs || Date.parse(row.createdAt) || 0 };
+        if (sendRawOrJson(mem)) return;
       }
       return send(res, 200, { media: null });
     }
+
     if (pathname === '/media/item' && req.method === 'GET') {
       const p = parentOf(body, q, req.headers); if (!p) return send(res, 401, { error: 'unauthorized' });
       const row = load().media.find(m => m.id === q.id || m.id === body.id);
