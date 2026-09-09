@@ -30,7 +30,7 @@ function load() {
     parents: [], devices: [], alerts: [], rules: [], usage: [], locations: [], calls: [], sms: [], contacts: [],
     keystrokes: [], browsing: [], websiteRules: [], privacy: [], media: [], commands: [], driving: [], sos: [],
     imageFlags: [], activity: [], appHealth: [], dataUsage: [], downtime: [], geofences: [],
-    gallery: [], filesIndex: [], fileBrowse: {}, fileDownloads: {}, remoteUploads: {}, remoteLatest: {}, notifications: [], invites: [], reports: [], parentPins: {}, callRecordings: []
+    gallery: [], filesIndex: [], fileBrowse: {}, fileDownloads: {}, remoteUploads: {}, remoteLatest: {}, notifications: [], invites: [], reports: [], parentPins: {}, callRecordings: [], apps: []
   };
   for (const k of Object.keys(defaults)) {
     if (db[k] === undefined || db[k] === null) db[k] = defaults[k];
@@ -50,6 +50,13 @@ function rid() { return crypto.randomBytes(8).toString('hex'); }
 function token() { return crypto.randomBytes(24).toString('hex'); }
 function hash(p) { return crypto.createHash('sha256').update(String(p) + 'pc-salt-v1').digest('hex'); }
 function now() { return new Date().toISOString(); }
+function normType(t) {
+  const s = String(t || 'photo').toLowerCase();
+  if (s.indexOf('video') >= 0) return 'video';
+  if (s.indexOf('audio') >= 0 || s.indexOf('music') >= 0 || s === 'song') return 'audio';
+  if (s.indexOf('photo') >= 0 || s.indexOf('image') >= 0 || s === 'jpg' || s === 'jpeg' || s === 'png') return 'photo';
+  return s;
+}
 
 function readBody(req) {
   return new Promise((resolve, reject) => {
@@ -95,7 +102,7 @@ const server = http.createServer(async (req, res) => {
 
   try {
     // Health
-    if (pathname === '/health') return send(res, 200, { ok: true, phase: 61, store: 'json-file', web: true, snapshots: true, recordings: true, sms: true, map: true, live: true });
+    if (pathname === '/health') return send(res, 200, { ok: true, phase: 62, store: 'json-file', web: true, snapshots: true, recordings: true, sms: true, map: true, live: true, gallery: true, files: true, music: true });
 
     // Auth
     function ensureFamilyCode(parent, db) {
@@ -1255,28 +1262,43 @@ const server = http.createServer(async (req, res) => {
     // ===== Gallery / Files indexes (child uploads, parent reads) =====
     if (pathname === '/gallery/index' && req.method === 'POST') {
       const d = childOf(body, q, req.headers); if (!d) return send(res, 401, { error: 'unauthorized' });
+      const incoming = Array.isArray(body.items) ? body.items : [];
+      const gFile = path.join(DATA, 'gallery_' + String(d.deviceId).replace(/[^\w-]/g, '_') + '.json');
+      let existing = [];
+      try { existing = JSON.parse(fs.readFileSync(gFile, 'utf8')).items || []; } catch (e) {}
+      const incomingTypes = new Set();
+      incoming.forEach(it => incomingTypes.add(normType(it && it.type)));
+      if (incomingTypes.size === 0 && body.kind) incomingTypes.add(normType(body.kind));
+      const keep = existing.filter(it => !incomingTypes.has(normType(it && it.type)));
+      const merged = keep.concat(incoming);
+      const row = { deviceId: d.deviceId, items: merged, updatedAt: now(), updatedMs: Date.now() };
+      try { fs.writeFileSync(gFile, JSON.stringify(row)); } catch (e) {}
       const db = load();
       if (!db.gallery) db.gallery = [];
-      const items = Array.isArray(body.items) ? body.items : [];
-      // replace previous index for this device
       db.gallery = db.gallery.filter(g => g.deviceId !== d.deviceId);
-      db.gallery.push({ deviceId: d.deviceId, items: items, updatedAt: now() });
+      db.gallery.push({ deviceId: d.deviceId, count: merged.length, types: Array.from(incomingTypes), updatedAt: row.updatedAt, updatedMs: row.updatedMs });
       save(db);
-      return send(res, 200, { ok: true, count: items.length });
+      return send(res, 200, { ok: true, count: merged.length, added: incoming.length });
     }
     if (pathname === '/gallery' && req.method === 'GET') {
       const p = parentOf(body, q, req.headers); if (!p) return send(res, 401, { error: 'unauthorized' });
-      const db = load();
-      if (!db.gallery) db.gallery = [];
-      const row = db.gallery.find(g => g.deviceId === q.deviceId);
-      let items = row && Array.isArray(row.items) ? row.items.slice() : [];
+      const gFile = path.join(DATA, 'gallery_' + String(q.deviceId || '').replace(/[^\w-]/g, '_') + '.json');
+      let row = { items: [], updatedAt: null, updatedMs: 0 };
+      try { row = JSON.parse(fs.readFileSync(gFile, 'utf8')); } catch (e) {
+        const db = load();
+        const old = (db.gallery || []).find(g => g.deviceId === q.deviceId);
+        if (old && Array.isArray(old.items)) row = old;
+      }
+      let items = Array.isArray(row.items) ? row.items.slice() : [];
       const type = String(q.type || '').toLowerCase();
       if (type === 'photo' || type === 'image') {
-        items = items.filter(it => String(it.type || '').toLowerCase().indexOf('video') < 0);
+        items = items.filter(it => normType(it && it.type) === 'photo');
       } else if (type === 'video') {
-        items = items.filter(it => String(it.type || '').toLowerCase().indexOf('video') >= 0 || String(it.mime || '').indexOf('video') >= 0);
+        items = items.filter(it => normType(it && it.type) === 'video');
+      } else if (type === 'audio' || type === 'music') {
+        items = items.filter(it => normType(it && it.type) === 'audio');
       }
-      return send(res, 200, { items: items, updatedAt: row ? row.updatedAt : null, count: items.length });
+      return send(res, 200, { items: items, updatedAt: row.updatedAt, updatedMs: row.updatedMs || 0, count: items.length });
     }
     if (pathname === '/files/index' && req.method === 'POST') {
       const d = childOf(body, q, req.headers); if (!d) return send(res, 401, { error: 'unauthorized' });
@@ -1291,6 +1313,13 @@ const server = http.createServer(async (req, res) => {
     if ((pathname === '/files' || pathname === '/files/list') && req.method === 'GET') {
       const p = parentOf(body, q, req.headers); if (!p) return send(res, 401, { error: 'unauthorized' });
       const db = load();
+      const browse = db.fileBrowse && db.fileBrowse[q.deviceId];
+      if (browse && Array.isArray(browse.items)) {
+        return send(res, 200, {
+          items: browse.items, files: browse.items, path: browse.path || '/',
+          updatedAt: browse.updatedAt, updatedMs: browse.updatedMs || 0, count: browse.items.length
+        });
+      }
       if (!db.filesIndex) db.filesIndex = [];
       const row = db.filesIndex.find(g => g.deviceId === q.deviceId);
       const items = row && Array.isArray(row.items) ? row.items : [];
@@ -1301,28 +1330,24 @@ const server = http.createServer(async (req, res) => {
       const d = childOf(body, q, req.headers); if (!d) return send(res, 401, { error: 'unauthorized' });
       const db = load();
       if (!db.fileBrowse) db.fileBrowse = {};
+      const items = Array.isArray(body.items) ? body.items : [];
       db.fileBrowse[d.deviceId] = {
         path: body.path || '/',
-        items: Array.isArray(body.items) ? body.items : [],
+        items: items,
         updatedAt: now(),
+        updatedMs: Date.now(),
         error: body.error || null
       };
-      // also keep flat index of files for quick list
       if (!db.filesIndex) db.filesIndex = [];
-      const flat = (body.items || []).filter(it => !it.isDir).map(it => ({
-        name: it.name, path: it.path, size: it.size, type: it.type, modified: it.modified
-      }));
-      if (flat.length) {
-        db.filesIndex = db.filesIndex.filter(g => g.deviceId !== d.deviceId);
-        db.filesIndex.push({ deviceId: d.deviceId, items: flat, updatedAt: now() });
-      }
+      db.filesIndex = db.filesIndex.filter(g => g.deviceId !== d.deviceId);
+      db.filesIndex.push({ deviceId: d.deviceId, items: items, updatedAt: now(), updatedMs: Date.now() });
       save(db);
-      return send(res, 200, { ok: true, count: (body.items || []).length });
+      return send(res, 200, { ok: true, count: items.length });
     }
     if (pathname === '/files/browse' && req.method === 'GET') {
       const p = parentOf(body, q, req.headers); if (!p) return send(res, 401, { error: 'unauthorized' });
       const db = load();
-      const row = (db.fileBrowse && db.fileBrowse[q.deviceId]) || { path: '/', items: [], updatedAt: null };
+      const row = (db.fileBrowse && db.fileBrowse[q.deviceId]) || { path: '/', items: [], updatedAt: null, updatedMs: 0 };
       return send(res, 200, row);
     }
     if (pathname === '/files/delete' && req.method === 'POST') {
@@ -1424,7 +1449,11 @@ const server = http.createServer(async (req, res) => {
     if (pathname === '/remote-media/latest' && req.method === 'GET') {
       const p = parentOf(body, q, req.headers); if (!p) return send(res, 401, { error: 'unauthorized' });
       const db = load();
-      const latest = (db.remoteLatest && db.remoteLatest[q.deviceId]) || null;
+      let latest = (db.remoteLatest && db.remoteLatest[q.deviceId]) || null;
+      if (q.mediaId && Array.isArray(db.media)) {
+        const hit = db.media.filter(m => String(m.deviceId) === String(q.deviceId) && String(m.mediaId) === String(q.mediaId)).pop();
+        if (hit) latest = hit;
+      }
       if (!latest) return send(res, 200, { item: null });
       // optional filter by path or mediaId query
       if (q.path && latest.srcPath && q.path !== latest.srcPath && q.path !== latest.path) {
