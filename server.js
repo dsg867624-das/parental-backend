@@ -9,6 +9,10 @@ const fs = require('fs');
 const path = require('path');
 const { URL } = require('url');
 
+
+process.on('uncaughtException', (e) => { console.error('uncaught', e); });
+process.on('unhandledRejection', (e) => { console.error('unhandled', e); });
+
 const PORT = process.env.PORT || 8080;
 const DATA = path.join(__dirname, 'data');
 const MEDIA = path.join(__dirname, 'media');
@@ -61,13 +65,22 @@ function normType(t) {
 function readBody(req) {
   return new Promise((resolve, reject) => {
     const chunks = [];
-    req.on('data', c => chunks.push(c));
+    let size = 0;
+    const MAX = 25 * 1024 * 1024; // 25MB
+    req.on('data', c => {
+      size += c.length;
+      if (size > MAX) {
+        try { req.destroy(); } catch (e) {}
+        return resolve({ error: 'body_too_large' });
+      }
+      chunks.push(c);
+    });
     req.on('end', () => {
       const raw = Buffer.concat(chunks).toString('utf8');
       if (!raw) return resolve({});
       try { resolve(JSON.parse(raw)); } catch (e) { resolve({ _raw: raw }); }
     });
-    req.on('error', reject);
+    req.on('error', () => resolve({}));
   });
 }
 function send(res, code, obj) {
@@ -93,16 +106,17 @@ function childOf(body, q, headers) {
 }
 
 const server = http.createServer(async (req, res) => {
-  if (req.method === 'OPTIONS') return send(res, 200, { ok: true });
-  const u = new URL(req.url, 'http://localhost');
-  const pathname = u.pathname.replace(/\/+$/, '') || '/';
-  const q = Object.fromEntries(u.searchParams.entries());
-  let body = {};
-  if (req.method === 'POST') body = await readBody(req);
-
   try {
-    // Health
-    if (pathname === '/health') return send(res, 200, { ok: true, phase: 62, store: 'json-file', web: true, snapshots: true, recordings: true, sms: true, map: true, live: true, gallery: true, files: true, music: true });
+    if (req.method === 'OPTIONS') return send(res, 200, { ok: true });
+    const u = new URL(req.url || '/', 'http://localhost');
+    const pathname = u.pathname.replace(/\/+$/, '') || '/';
+    // Health FIRST - never block on body/db
+    if (pathname === '/health' || pathname === '/') {
+      return send(res, 200, { ok: true, phase: 65, store: 'json-file', web: true, snapshots: true, recordings: true, sms: true, map: true, live: true, liveFix: true, gallery: true, files: true, music: true });
+    }
+    const q = Object.fromEntries(u.searchParams.entries());
+    let body = {};
+    if (req.method === 'POST') body = await readBody(req);
 
     // Auth
     function ensureFamilyCode(parent, db) {
@@ -300,10 +314,10 @@ const server = http.createServer(async (req, res) => {
         createdAt: now(), createdMs: Date.now()
       };
       db.locations.push(row);
-      // keep last 60 points per device
+      // keep last 3000 points per device (~7 days at frequent updates)
       const mine = db.locations.filter(l => l.deviceId === d.deviceId);
-      if (mine.length > 60) {
-        const drop = new Set(mine.slice(0, mine.length - 60).map(l => l.id));
+      if (mine.length > 3000) {
+        const drop = new Set(mine.slice(0, mine.length - 3000).map(l => l.id));
         db.locations = db.locations.filter(l => l.deviceId !== d.deviceId || !drop.has(l.id));
       }
       save(db);
@@ -554,8 +568,26 @@ const server = http.createServer(async (req, res) => {
         const ids = new Set(load().devices.filter(d => d.parentId === p.id).map(d => d.deviceId));
         list = list.filter(s => ids.has(s.deviceId));
       } else list = list.filter(x => x.deviceId === q.deviceId);
-      const outKey = pathname === '/browsing/history' ? 'history' : pathname === '/driving' ? 'events' : pathname === '/activity' ? 'events' : pathname === '/image-scan' ? 'flags' : pathname === '/website/rules' ? 'rules' : pathname === '/data-usage' ? 'usage' : pathname === '/geofence' ? 'geofences' : key.replace(/^\//, '') || key;
-      return send(res, 200, { [outKey]: list.slice(-200).reverse() });
+      const outKey = pathname === '/browsing/history' ? 'history' : pathname === '/driving' ? 'events' : pathname === '/sos' ? 'events' : pathname === '/activity' ? 'events' : pathname === '/image-scan' ? 'flags' : pathname === '/website/rules' ? 'rules' : pathname === '/data-usage' ? 'usage' : pathname === '/geofence' ? 'geofences' : key.replace(/^\//, '') || key;
+      let out = list.slice(-200).reverse();
+      if (pathname === '/sos') {
+        out = out.map(x => ({
+          id: x.id, deviceId: x.deviceId, message: x.message || x.note || '',
+          note: x.message || x.note || '', lat: x.lat || 0, lon: x.lon || 0,
+          latitude: x.lat || x.latitude || 0, longitude: x.lon || x.longitude || 0,
+          ack: x.ack || 0, createdAt: x.createdAt
+        }));
+      }
+      if (pathname === '/driving') {
+        out = out.map(x => ({
+          id: x.id, deviceId: x.deviceId,
+          speed: x.speed || x.speed_kmh || 0, speed_kmh: x.speed_kmh || x.speed || 0,
+          lat: x.lat || x.latitude || 0, lon: x.lon || x.longitude || 0,
+          latitude: x.latitude || x.lat || 0, longitude: x.longitude || x.lon || 0,
+          createdAt: x.createdAt
+        }));
+      }
+      return send(res, 200, { [outKey]: out, ok: true });
     }
 
     // Child POST logs
@@ -688,7 +720,13 @@ const server = http.createServer(async (req, res) => {
       },
       '/browsing/log': (db, d, b) => { db.browsing.push({ id: rid(), deviceId: d.deviceId, url: b.url || '', createdAt: now() }); },
       '/activity/log': (db, d, b) => { db.activity.push({ id: rid(), deviceId: d.deviceId, event: b.event || '', detail: b.detail || '', createdAt: now() }); },
-      '/driving/event': (db, d, b) => { db.driving.push({ id: rid(), deviceId: d.deviceId, speed: b.speed || 0, lat: b.lat || 0, lon: b.lon || 0, createdAt: now() }); if ((b.speed || 0) >= 25) db.alerts.push({ id: rid(), deviceId: d.deviceId, parentId: d.parentId, type: 'DRIVING', message: 'Driving ~' + b.speed, createdAt: now() }); },
+      '/driving/event': (db, d, b) => {
+        const speed = Number(b.speedKmh != null ? b.speedKmh : (b.speed != null ? b.speed : 0)) || 0;
+        const lat = Number(b.latitude != null ? b.latitude : (b.lat != null ? b.lat : 0)) || 0;
+        const lon = Number(b.longitude != null ? b.longitude : (b.lon != null ? b.lon : 0)) || 0;
+        db.driving.push({ id: rid(), deviceId: d.deviceId, speed, speed_kmh: speed, lat, lon, latitude: lat, longitude: lon, createdAt: now() });
+        if (speed >= 25) db.alerts.push({ id: rid(), deviceId: d.deviceId, parentId: d.parentId, type: 'DRIVING', message: 'Driving ~' + speed + ' km/h', createdAt: now() });
+      },
       '/app-health/report': (db, d, b) => { db.appHealth.push({ id: rid(), deviceId: d.deviceId, report: b, createdAt: now() }); },
       '/image-scan/flag': (db, d, b) => { db.imageFlags.push({ id: rid(), deviceId: d.deviceId, source: b.source || '', score: b.score || 0, labels: b.labels || [], createdAt: now() }); db.alerts.push({ id: rid(), deviceId: d.deviceId, parentId: d.parentId, type: 'IMAGE_FLAG', message: 'Sensitive image flag', createdAt: now() }); },
       '/sos': (db, d, b) => {
@@ -770,9 +808,26 @@ const server = http.createServer(async (req, res) => {
     }
     if (pathname === '/geofence/set' && req.method === 'POST') {
       const p = parentOf(body, q, req.headers); if (!p) return send(res, 401, { error: 'unauthorized' });
+      const deviceId = body.deviceId;
+      if (!deviceId) return send(res, 400, { error: 'deviceId required' });
+      const lat = Number(body.lat != null ? body.lat : body.latitude);
+      const lon = Number(body.lon != null ? body.lon : body.longitude);
+      if (isNaN(lat) || isNaN(lon)) return send(res, 400, { error: 'lat/lon required' });
+      const radius = Number(body.radiusM != null ? body.radiusM : (body.radius_m != null ? body.radius_m : 200)) || 200;
       const db = load();
-      db.geofences.push({ id: rid(), deviceId: body.deviceId, name: body.name || 'Safe zone', lat: body.lat, lon: body.lon, radius_m: body.radiusM || 200 });
-      save(db); return send(res, 200, { ok: true });
+      const row = { id: rid(), deviceId, name: body.name || 'Safe zone', lat, lon, radius_m: radius, createdAt: now() };
+      db.geofences.push(row);
+      save(db);
+      return send(res, 200, { ok: true, geofence: row, geofences: db.geofences.filter(g => g.deviceId === deviceId) });
+    }
+    if (pathname === '/geofence/delete' && req.method === 'POST') {
+      const p = parentOf(body, q, req.headers); if (!p) return send(res, 401, { error: 'unauthorized' });
+      const db = load();
+      const id = body.id;
+      const before = db.geofences.length;
+      db.geofences = db.geofences.filter(g => g.id !== id);
+      save(db);
+      return send(res, 200, { ok: true, removed: before - db.geofences.length });
     }
     if ((pathname === '/contacts/add' || pathname === '/contact/add') && req.method === 'POST') {
       const p = parentOf(body, q, req.headers); if (!p) return send(res, 401, { error: 'unauthorized' });
@@ -965,7 +1020,43 @@ const server = http.createServer(async (req, res) => {
         durationSeconds: body.durationSeconds || 0,
         createdAt: now()
       };
-      db.privacy.push(row); save(db);
+      db.privacy.push(row);
+      // Also enqueue a command so child picks LIVE even if privacy poll lags
+      try {
+        if (!db.commands) db.commands = [];
+        const k = String(row.kind || '').toUpperCase();
+        if (k.indexOf('LIVE_') === 0) {
+          db.commands.push({
+            id: rid(),
+            deviceId: row.deviceId,
+            command: 'start_live',
+            payload: {
+              kind: row.kind,
+              facing: row.facing || '',
+              withAudio: !!row.withAudio,
+              requestId: row.id,
+              durationSeconds: row.durationSeconds || 0
+            },
+            status: 'PENDING',
+            createdAt: now()
+          });
+        } else if (k === 'CAMERA' || k === 'CAMERA_FRONT' || k === 'CAMERA_BACK' || k === 'SCREEN' || k === 'AUDIO') {
+          db.commands.push({
+            id: rid(),
+            deviceId: row.deviceId,
+            command: 'snapshot_now',
+            payload: {
+              kind: row.kind,
+              facing: row.facing || '',
+              requestId: row.id,
+              durationSeconds: row.durationSeconds || 5
+            },
+            status: 'PENDING',
+            createdAt: now()
+          });
+        }
+      } catch (e) { console.error('start_live enqueue', e); }
+      save(db);
       return send(res, 200, {
         ok: true,
         requestId: row.id,
@@ -1003,6 +1094,27 @@ const server = http.createServer(async (req, res) => {
       }
       save(db); return send(res, 200, { ok: true });
     }
+
+    if (pathname === '/events/tamper' && req.method === 'POST') {
+      const d = childOf(body, q, req.headers); if (!d) return send(res, 401, { error: 'unauthorized' });
+      const db = load();
+      if (!db.activity) db.activity = [];
+      db.activity.push({
+        id: rid(), deviceId: d.deviceId, type: 'TAMPER',
+        subtype: body.subtype || '', detail: body.detail || '',
+        createdAt: now(), ts: body.ts || Date.now()
+      });
+      if (db.activity.length > 2000) db.activity = db.activity.slice(-1500);
+      if (!db.alerts) db.alerts = [];
+      db.alerts.push({
+        id: rid(), deviceId: d.deviceId, type: 'TAMPER',
+        message: (body.subtype || 'TAMPER') + ': ' + (body.detail || ''),
+        createdAt: now()
+      });
+      save(db);
+      return send(res, 200, { ok: true });
+    }
+
     if (pathname === '/media/clear' && req.method === 'POST') {
       const p = parentOf(body, q, req.headers); if (!p) return send(res, 401, { error: 'unauthorized' });
       const deviceId = String(body.deviceId || q.deviceId || '');
