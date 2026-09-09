@@ -14,3 +14,12 @@ node server.js
 - Free instance is fine
 
 Health check: `GET /health`
+
+## Web dashboard (AirDroid style)
+Open in browser after deploy:
+`https://YOUR-RENDER-URL/`
+or
+`https://YOUR-RENDER-URL/web`
+
+Same parent email/password as the Parent app.
+Photos / files / location / live view open inside this dashboard.
