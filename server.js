@@ -44,6 +44,14 @@ function load() {
   try { db = JSON.parse(fs.readFileSync(DB_FILE, 'utf8')); }
   catch (e) { db = {}; }
   MEM_DB = ensureDefaults(db);
+  try {
+    // Huge media/command history made every request slow (account create 2 min, live freeze)
+    if (MEM_DB.media && MEM_DB.media.length > 250) MEM_DB.media = MEM_DB.media.slice(-120);
+    if (MEM_DB.commands && MEM_DB.commands.length > 800) {
+      const pending = MEM_DB.commands.filter(c => c.status === 'PENDING');
+      MEM_DB.commands = pending.concat(MEM_DB.commands.slice(-200));
+    }
+  } catch (e) {}
   return MEM_DB;
 }
 function save(db) {
@@ -94,7 +102,7 @@ function send(res, code, obj) {
   res.writeHead(code, {
     'Content-Type': 'application/json',
     'Access-Control-Allow-Origin': '*',
-    'Access-Control-Allow-Headers': 'Content-Type, x-session-token, x-child-token',
+    'Access-Control-Allow-Headers': 'Content-Type, Authorization, x-session-token, x-child-token',
     'Access-Control-Allow-Methods': 'GET,POST,OPTIONS'
   });
   res.end(body);
@@ -125,7 +133,7 @@ const server = http.createServer(async (req, res) => {
     let pathname = u.pathname.replace(/\/+$/, '') || '/';
     // Health FIRST - never block on body/db
     if (pathname === '/health' || pathname === '/') {
-      return send(res, 200, { ok: true, phase: 73, store: 'json-file', web: true, snapshots: true, recordings: true, sms: true, map: true, live: true, liveFix: true, gallery: true, files: true, music: true });
+      return send(res, 200, { ok: true, phase: 74, store: 'json-file', web: true, snapshots: true, recordings: true, sms: true, map: true, live: true, liveFix: true, gallery: true, files: true, music: true });
     }
     const q = Object.fromEntries(u.searchParams.entries());
     let body = {};
@@ -1201,7 +1209,7 @@ const server = http.createServer(async (req, res) => {
         return true;
       });
       toDel.forEach(k => liveLatest.delete(k));
-      return send(res, 200, { ok: true, cleared: toDel.length, phase: 73 });
+      return send(res, 200, { ok: true, cleared: toDel.length, phase: 74 });
     }
 
     if (pathname === '/media/upload' && req.method === 'POST') {
@@ -1255,7 +1263,7 @@ const server = http.createServer(async (req, res) => {
             liveLatest.set(d.deviceId + '|SCREEN', entry);
           }
         }
-        // ONLY snapshots/manual to disk — NEVER live frames (old JPEG caused permanent stuck frame)
+        // ONLY snapshots/manual to disk — NEVER live frames (disk write froze Railway + stuck first frame)
         try {
           if ((scheduled || manualSnap) && !isLive) {
             const ext = (kindU.indexOf('AUDIO') >= 0) ? '.pcm' : '.jpg';
@@ -1264,6 +1272,10 @@ const server = http.createServer(async (req, res) => {
           }
         } catch (e) { /* ignore */ }
       }
+      // LIVE frames stay in RAM only — do NOT save db.json (was the #1 hang / stuck-frame bug)
+      if (isLive && !scheduled && !manualSnap) {
+        return send(res, 200, { ok: true, id, kind: kindU, live: true });
+      }
       const db = load();
       db.media.push({
         id, deviceId: d.deviceId, kind: kindU, path: filePath,
@@ -1271,10 +1283,9 @@ const server = http.createServer(async (req, res) => {
         source: isLive ? 'LIVE' : (scheduled ? 'SCHEDULED' : 'MANUAL'),
         requestId: body.requestId || q.req || null
       });
-      // Trim live rows
       const liveRows = db.media.filter(m => m.deviceId === d.deviceId && m.source === 'LIVE');
-      if (liveRows.length > 12) {
-        const dropLive = liveRows.slice(0, liveRows.length - 12);
+      if (liveRows.length > 8) {
+        const dropLive = liveRows.slice(0, liveRows.length - 8);
         const dropIds = new Set(dropLive.map(m => m.id));
         dropLive.forEach(m => { try { if (m.path && fs.existsSync(m.path)) fs.unlinkSync(m.path); } catch (e) {} });
         db.media = db.media.filter(m => !dropIds.has(m.id));
