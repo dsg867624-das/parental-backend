@@ -13,16 +13,11 @@ const { URL } = require('url');
 process.on('uncaughtException', (e) => { console.error('uncaught', e); });
 process.on('unhandledRejection', (e) => { console.error('unhandled', e); });
 
-const PORT = Number(process.env.PORT) || 8080;
+const PORT = process.env.PORT || 8080;
 const DATA = path.join(__dirname, 'data');
 const MEDIA = path.join(__dirname, 'media');
-try {
-  [DATA, MEDIA].forEach(d => { if (!fs.existsSync(d)) fs.mkdirSync(d, { recursive: true }); });
-} catch (e) {
-  console.error('mkdir warn', e && e.message);
-}
+[DATA, MEDIA].forEach(d => { if (!fs.existsSync(d)) fs.mkdirSync(d, { recursive: true }); });
 const DB_FILE = path.join(DATA, 'db.json');
-console.log('boot phase=75 port=' + PORT + ' data=' + DATA);
 
 // In-memory hot path for LIVE streams (audio/camera/screen).
 // Avoids disk read on every parent poll → much lower latency, closer to AirDroid Kids live voice.
@@ -138,7 +133,7 @@ const server = http.createServer(async (req, res) => {
     let pathname = u.pathname.replace(/\/+$/, '') || '/';
     // Health FIRST - never block on body/db
     if (pathname === '/health' || pathname === '/') {
-      return send(res, 200, { ok: true, phase: 75, store: 'json-file', web: true, snapshots: true, recordings: true, sms: true, map: true, live: true, liveFix: true, gallery: true, files: true, music: true });
+      return send(res, 200, { ok: true, phase: 77, store: 'json-file', web: true, snapshots: true, recordings: true, sms: true, map: true, live: true, liveFix: true, gallery: true, files: true, music: true });
     }
     const q = Object.fromEntries(u.searchParams.entries());
     let body = {};
@@ -301,20 +296,38 @@ const server = http.createServer(async (req, res) => {
         if (p.linkedParentId && x.id === p.linkedParentId) parentIds.add(x.id);
         if (p.familyCode && x.familyCode === p.familyCode) parentIds.add(x.id);
       });
-      return send(res, 200, { devices: db.devices.filter(d => parentIds.has(d.parentId)).map(d => ({
-        deviceId: d.deviceId,
-        name: d.name,
-        childName: d.name,
-        phoneName: d.phoneName || d.model || d.name || 'Phone',
-        model: d.model || '',
-        online: d.online ? 1 : 0,
-        battery: (d.battery != null && d.battery >= 0) ? d.battery : -1,
-        charging: d.charging ? 1 : 0,
-        lastSeen: d.lastSeen,
-        lat: d.lat,
-        lon: d.lon,
-        sims: Array.isArray(d.sims) ? d.sims : []
-      })) });
+      // Online if heartbeat within 5 minutes (SIM switch / Doze grace)
+      const ONLINE_MS = 5 * 60 * 1000;
+      const nowMs = Date.now();
+      let dirty = false;
+      const list = db.devices.filter(d => parentIds.has(d.parentId)).map(d => {
+        let lastMs = 0;
+        try {
+          if (d.lastSeen) lastMs = Date.parse(String(d.lastSeen));
+        } catch (e) { lastMs = 0; }
+        if (!lastMs || isNaN(lastMs)) lastMs = 0;
+        const isOnline = lastMs > 0 && (nowMs - lastMs) < ONLINE_MS;
+        if (d.online && !isOnline) { d.online = 0; dirty = true; }
+        if (!d.online && isOnline) { d.online = 1; dirty = true; }
+        return {
+          deviceId: d.deviceId,
+          name: d.name,
+          childName: d.name,
+          phoneName: d.phoneName || d.model || d.name || 'Phone',
+          model: d.model || '',
+          online: isOnline ? 1 : 0,
+          battery: (d.battery != null && d.battery >= 0) ? d.battery : -1,
+          charging: d.charging ? 1 : 0,
+          lastSeen: d.lastSeen,
+          lastSeenAgeSec: lastMs ? Math.round((nowMs - lastMs) / 1000) : null,
+          netType: d.netType || '',
+          lat: d.lat,
+          lon: d.lon,
+          sims: Array.isArray(d.sims) ? d.sims : []
+        };
+      });
+      if (dirty) { try { save(db); } catch (e) {} }
+      return send(res, 200, { devices: list, phase: 77 });
     }
     if (pathname === '/device/remove' && req.method === 'POST') {
       const p = parentOf(body, q, req.headers);
@@ -329,7 +342,9 @@ const server = http.createServer(async (req, res) => {
       const d = childOf(body, q, req.headers);
       if (!d) return send(res, 401, { error: 'unauthorized' });
       const db = load();
-      const x = db.devices.find(a => a.deviceId === d.deviceId);
+      // Prefer token match (stable) over deviceId in case of id drift
+      let x = db.devices.find(a => a.childToken && d.childToken && a.childToken === d.childToken);
+      if (!x) x = db.devices.find(a => a.deviceId === d.deviceId);
       if (x) {
         x.online = 1;
         let bat = body.battery != null ? body.battery : body.batteryLevel;
@@ -340,11 +355,12 @@ const server = http.createServer(async (req, res) => {
         x.charging = (body.charging || body.batteryCharging) ? 1 : 0;
         if (body.model) x.model = String(body.model);
         if (body.phoneName) x.phoneName = String(body.phoneName);
+        if (body.netType) x.netType = String(body.netType);
         if (Array.isArray(body.sims)) x.sims = body.sims;
         x.lastSeen = now();
         save(db);
       }
-      return send(res, 200, { ok: true, battery: x && x.battery, charging: x && x.charging });
+      return send(res, 200, { ok: true, battery: x && x.battery, charging: x && x.charging, phase: 77 });
     }
 
     if (pathname === '/location/update' && req.method === 'POST') {
@@ -1214,7 +1230,7 @@ const server = http.createServer(async (req, res) => {
         return true;
       });
       toDel.forEach(k => liveLatest.delete(k));
-      return send(res, 200, { ok: true, cleared: toDel.length, phase: 75 });
+      return send(res, 200, { ok: true, cleared: toDel.length, phase: 77 });
     }
 
     if (pathname === '/media/upload' && req.method === 'POST') {
