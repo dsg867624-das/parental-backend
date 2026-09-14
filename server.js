@@ -24,10 +24,45 @@ let presenceSaveTimer = null;
 // Was 8s — caused ONLINE/OFFLINE flapping on mobile even with good internet.
 // Child heartbeats ~2.5s; allow long grace so brief net blips do not flip status.
 // Sticky presence — AirDroid-style: do not flap on brief mobile blips
-const ONLINE_MS = 180000; // 3 min soft window without signal
-const ONLINE_HARD_MS = 300000; // 5 min hard offline
-const PRESENCE_FLIP_COOLDOWN_MS = 120000; // presence alerts max every 2 min
-const OFFLINE_MISS_NEEDED = 4; // consecutive sweep misses before offline
+const ONLINE_MS = 90000; // 90s silence before pulse-based OFFLINE
+const ONLINE_HARD_MS = 180000; // 3 min = real disconnect
+const PRESENCE_FLIP_COOLDOWN_MS = 25000;
+const OFFLINE_MISS_NEEDED = 5;
+const presenceHolds = new Map(); // deviceId -> { a:{alive,t,gen}, b:{alive,t,gen} }
+
+function holdRecord(deviceId) {
+  let rec = presenceHolds.get(deviceId);
+  if (!rec) {
+    rec = { a: null, b: null, wa: null, wb: null };
+    presenceHolds.set(deviceId, rec);
+  } else {
+    // Hot-upgrade old records missing WS slots after process lifetime
+    if (!('wa' in rec)) rec.wa = null;
+    if (!('wb' in rec)) rec.wb = null;
+    if (!('a' in rec)) rec.a = null;
+    if (!('b' in rec)) rec.b = null;
+  }
+  return rec;
+}
+function linkCount(deviceId) {
+  const rec = presenceHolds.get(deviceId);
+  if (!rec) return 0;
+  const nowMs = Date.now();
+  const fresh = (s) => s && s.alive && (nowMs - s.t) < 50000;
+  let n = 0;
+  if (fresh(rec.a)) n++;
+  if (fresh(rec.b)) n++;
+  if (fresh(rec.wa)) n++;
+  if (fresh(rec.wb)) n++;
+  return n;
+}
+function anyHoldAlive(deviceId) {
+  const rec = presenceHolds.get(deviceId);
+  if (!rec) return false;
+  const nowMs = Date.now();
+  const fresh = (s) => s && s.alive && (nowMs - s.t) < 50000;
+  return fresh(rec.a) || fresh(rec.b) || fresh(rec.wa) || fresh(rec.wb);
+}
 
 function ensureTomb(db) {
   if (!db.deletedSms) db.deletedSms = [];
@@ -128,7 +163,10 @@ function markPresence(d, online, reason) {
         name: d.name,
         parentId: d.parentId,
         token: d.childToken,
-        lastFlipMs: lastFlip
+        lastFlipMs: lastFlip,
+        misses: prev && prev.misses ? prev.misses : 0,
+        // Keep deferred power-off marker through cooldown
+        pendingOffMs: prev && prev.pendingOffMs ? prev.pendingOffMs : 0
       });
       return;
     }
@@ -140,7 +178,9 @@ function markPresence(d, online, reason) {
     parentId: d.parentId,
     token: d.childToken,
     lastFlipMs: (!!was !== !!online) ? nowMs : lastFlip,
-    misses: online ? 0 : (prev && prev.misses ? prev.misses : 0)
+    misses: online ? 0 : (prev && prev.misses ? prev.misses : 0),
+    // Real online beat cancels deferred power-off; offline clears it too
+    pendingOffMs: online ? 0 : 0
   });
   if (!!was !== !!online) {
     const db = load();
@@ -151,9 +191,10 @@ function markPresence(d, online, reason) {
     notifyPresenceWaiters(d.parentId);
     console.log("presence", d.name || d.deviceId, online ? "ONLINE" : "OFFLINE", reason || "");
   } else if (online) {
-    // Refresh lastMs without alert
     const cur = presenceRam.get(d.deviceId);
     if (cur) cur.lastMs = nowMs;
+    // Do NOT dirty-save db.json on every 2.5s beat — that froze Railway and looked like disconnect.
+    return;
   }
 }
 
@@ -175,6 +216,25 @@ function sweepPresence() {
     let changed = false;
     for (const d of (db.devices || [])) {
       if (!d || !d.deviceId) continue;
+      const held = anyHoldAlive(d.deviceId);
+      if (held) {
+        const prev = presenceRam.get(d.deviceId);
+        presenceRam.set(d.deviceId, {
+          lastMs: nowMs,
+          online: true,
+          name: d.name,
+          parentId: d.parentId,
+          token: d.childToken,
+          misses: 0,
+          lastFlipMs: prev && prev.lastFlipMs ? prev.lastFlipMs : 0,
+          // Live hold means device is still up — cancel deferred power-off
+          pendingOffMs: 0
+        });
+        if (prev && prev.online === false) {
+          try { markPresence(d, true, 'hold alive'); } catch (e) {}
+        }
+        continue;
+      }
       const pr = presenceRam.get(d.deviceId);
       let lastMs = pr ? (pr.lastMs || 0) : 0;
       if (!lastMs && d.lastSeen) {
@@ -187,6 +247,7 @@ function sweepPresence() {
       let misses = pr && typeof pr.misses === 'number' ? pr.misses : 0;
       if (softOn) misses = 0;
       else if (was) misses += 1;
+      const keepPendingOff = pr && pr.pendingOffMs ? pr.pendingOffMs : 0;
       presenceRam.set(d.deviceId, {
         lastMs: lastMs || 0,
         online: was && (softOn || (!hardOff && misses < OFFLINE_MISS_NEEDED)) ? true : (softOn ? true : false),
@@ -194,11 +255,14 @@ function sweepPresence() {
         parentId: d.parentId,
         token: d.childToken,
         misses: misses,
-        lastFlipMs: pr && pr.lastFlipMs ? pr.lastFlipMs : 0
+        lastFlipMs: pr && pr.lastFlipMs ? pr.lastFlipMs : 0,
+        // CRITICAL: do not drop deferred power-off across sweeps
+        pendingOffMs: keepPendingOff
       });
-      // Stay ONLINE through blips; only offline after hard timeout OR enough consecutive misses
-      if (was && (hardOff || (!softOn && misses >= OFFLINE_MISS_NEEDED))) {
-        markPresence(d, false, hardOff ? "hard timeout" : "missed heartbeats");
+      const pendingOff = keepPendingOff && (nowMs - keepPendingOff) > 20000 && (nowMs - (lastMs||0)) > 15000;
+      // Stay ONLINE through blips. Real OFFLINE: 5 min silent OR confirmed shutdown (20s no beat).
+      if (was && (hardOff || pendingOff)) {
+        markPresence(d, false, hardOff ? "hard timeout" : "power off confirmed");
         changed = true;
       }
     }
@@ -233,8 +297,9 @@ function mjpegKeys(deviceId, kindU) {
 
 function pushContinuous(deviceId, kindU, entry) {
   try {
-    if (!entry || !entry.b64) return;
-    const buf = Buffer.from(String(entry.b64), 'base64');
+    if (!entry) return;
+    const buf = entry.buf || (entry.b64 ? Buffer.from(String(entry.b64), 'base64') : null);
+    if (!buf || !buf.length) return;
     const ms = entry.createdMs || Date.now();
     const isAudio = String(kindU || '').toUpperCase().indexOf('AUDIO') >= 0;
     for (const k of mjpegKeys(deviceId, kindU)) {
@@ -245,7 +310,6 @@ function pushContinuous(deviceId, kindU, entry) {
         if (!w.alive || w.res.writableEnded) continue;
         try {
           if (isAudio || w.isAudio) {
-            // raw PCM chunk with length header line for parent parser: PCM\nlen\n + bytes
             w.res.write('PCM\n' + buf.length + '\n' + ms + '\n');
             w.res.write(buf);
           } else {
@@ -256,6 +320,7 @@ function pushContinuous(deviceId, kindU, entry) {
             w.res.write(buf);
             w.res.write('\r\n');
           }
+          try { if (typeof w.res.flush === 'function') w.res.flush(); } catch (e) {}
           keep.push(w);
         } catch (e) {
           try { w.alive = false; } catch (e2) {}
@@ -434,7 +499,9 @@ function childOf(body, q, headers) {
         parentId: d.parentId,
         token: d.childToken,
         lastFlipMs: prev && prev.lastFlipMs ? prev.lastFlipMs : 0,
-        misses: 0
+        misses: 0,
+        // Live API = device is up — cancel deferred power-off
+        pendingOffMs: 0
       });
       d.lastSeen = now();
       d.online = 1;
@@ -454,7 +521,7 @@ const server = http.createServer(async (req, res) => {
     let pathname = u.pathname.replace(/\/+$/, '') || '/';
     // Health FIRST - never block on body/db
     if (pathname === '/health' || pathname === '/') {
-      return send(res, 200, { ok: true, phase: 138, store: 'json-file', web: true, snapshots: true, recordings: true, sms: true, map: true, live: true, liveFix: true, gallery: true, files: true, music: true });
+      return send(res, 200, { ok: true, phase: 159, store: 'json-file', web: true, snapshots: true, recordings: true, sms: true, map: true, live: true, liveFix: true, gallery: true, files: true, music: true });
     }
     const q = Object.fromEntries(u.searchParams.entries());
     let body = {};
@@ -628,9 +695,10 @@ const server = http.createServer(async (req, res) => {
           if (!lastMs && d.lastSeen) lastMs = Date.parse(String(d.lastSeen));
         } catch (e) { lastMs = 0; }
         if (!lastMs || isNaN(lastMs)) lastMs = 0;
-        const isOnline = lastMs > 0 && (nowMs - lastMs) < ONLINE_MS;
-        if (d.online && !isOnline) { d.online = 0; dirty = true; }
-        if (!d.online && isOnline) { d.online = 1; dirty = true; }
+        const ramOn = pr && pr.online === true;
+        const held = anyHoldAlive(d.deviceId);
+        const pulseOn = lastMs > 0 && (nowMs - lastMs) < ONLINE_MS;
+        const isOnline = !!held || ramOn || pulseOn;
         return {
           deviceId: d.deviceId,
           name: d.name,
@@ -638,6 +706,8 @@ const server = http.createServer(async (req, res) => {
           phoneName: d.phoneName || d.model || d.name || 'Phone',
           model: d.model || '',
           online: isOnline ? 1 : 0,
+          links: linkCount(d.deviceId),
+          maxLinks: 4,
           battery: (d.battery != null && d.battery >= 0) ? d.battery : -1,
           charging: d.charging ? 1 : 0,
           lastSeen: d.lastSeen,
@@ -649,13 +719,13 @@ const server = http.createServer(async (req, res) => {
         };
       });
       if (dirty) { try { save(db); } catch (e) {} }
-      return send(res, 200, { devices: list, phase: 138 });
+      return send(res, 200, { devices: list, phase: 159 });
     }
 
     if ((pathname === '/presence' || pathname === '/presence/status') && req.method === 'GET') {
       const p = parentOf(body, q, req.headers);
       if (!p) return send(res, 401, { error: 'unauthorized' });
-      sweepPresence();
+      // Do NOT sweep here — sweep can race and flip ONLINE during parent poll
       const db = load();
       const parentIds = new Set([p.id]);
       db.parents.forEach(x => {
@@ -666,15 +736,116 @@ const server = http.createServer(async (req, res) => {
       const devices = db.devices.filter(d => parentIds.has(d.parentId)).map(d => {
         const pr = presenceRam.get(d.deviceId);
         const lastMs = (pr && pr.lastMs) || (d.lastSeen ? Date.parse(String(d.lastSeen)) : 0) || 0;
-        const isOnline = lastMs > 0 && (nowMs - lastMs) < ONLINE_MS;
+        const held = anyHoldAlive(d.deviceId);
+        const ramOn = pr && pr.online === true;
+        const isOnline = !!held || ramOn || (lastMs > 0 && (nowMs - lastMs) < ONLINE_MS);
         return {
           deviceId: d.deviceId, name: d.name, online: isOnline ? 1 : 0,
+          links: linkCount(d.deviceId),
+          maxLinks: 4,
           lastSeenAgeSec: lastMs ? Math.round((nowMs - lastMs) / 1000) : null,
           battery: d.battery, charging: d.charging ? 1 : 0, netType: d.netType || ''
         };
       });
-      return send(res, 200, { ok: true, devices, ts: nowMs, onlineMs: ONLINE_MS, phase: 138 });
+      return send(res, 200, { ok: true, devices, ts: nowMs, onlineMs: ONLINE_MS, phase: 159 });
     }
+    if (pathname === '/presence/hold' && req.method === 'GET') {
+      const d = childOf(body, q, req.headers);
+      if (!d) return send(res, 401, { error: 'unauthorized' });
+      const slot = (q.slot === 'b' || q.slot === 'B') ? 'b' : 'a';
+      const rec = holdRecord(d.deviceId);
+      const prevSlot = rec[slot] || { gen: 0 };
+      const gen = (prevSlot.gen || 0) + 1;
+      rec[slot] = { alive: true, t: Date.now(), gen: gen };
+      d.lastSeen = now();
+      d.online = 1;
+      try { markPresence(d, true, 'hold-' + slot); } catch (e) {}
+      res.writeHead(200, {
+        'Content-Type': 'text/plain',
+        'Cache-Control': 'no-store, no-transform',
+        'Connection': 'keep-alive',
+        'X-Accel-Buffering': 'no'
+      });
+      try { if (res.socket) { res.socket.setNoDelay(true); res.socket.setKeepAlive(true, 5000); } } catch (e) {}
+      try { res.write('HOLD ' + slot + '\n'); if (typeof res.flush === 'function') res.flush(); } catch (e) {}
+      let ended = false;
+      let closedOnce = false;
+      const ping = setInterval(() => {
+        try {
+          res.write('P\n');
+          if (typeof res.flush === 'function') res.flush();
+          const r = presenceHolds.get(d.deviceId);
+          if (r && r[slot] && r[slot].gen === gen) { r[slot].t = Date.now(); r[slot].alive = true; }
+          d.lastSeen = now();
+          const pr = presenceRam.get(d.deviceId);
+          if (pr) {
+            pr.lastMs = Date.now();
+            pr.online = true;
+            pr.misses = 0;
+            pr.pendingOffMs = 0;
+          }
+        } catch (e) { try { clearInterval(ping); } catch (e2) {} }
+      }, 2000);
+      // Refresh before typical proxy idle kill (~60s). Second slot is staggered so one stays up.
+      const cap = setTimeout(() => {
+        ended = true;
+        try { clearInterval(ping); } catch (e) {}
+        try { res.end(); } catch (e) {}
+      }, 40000);
+      const dropped = () => {
+        if (closedOnce) return;
+        closedOnce = true;
+        try { clearInterval(ping); } catch (e) {}
+        try { clearTimeout(cap); } catch (e) {}
+        const r = presenceHolds.get(d.deviceId);
+        if (!r || !r[slot] || r[slot].gen !== gen) return; // newer socket on this slot
+        // Soft grace for reconnect — do NOT refresh `t` (that inflated LINK forever)
+        r[slot].alive = true;
+        const dropGen = gen;
+        const graceMs = ended ? 3000 : 8000;
+        setTimeout(() => {
+          const cur = presenceHolds.get(d.deviceId);
+          if (!cur || !cur[slot] || cur[slot].gen !== dropGen) return;
+          cur[slot].alive = false;
+          // NEVER mark OFFLINE from a single hold drop.
+          // Other slot OR heartbeat keeps the child ONLINE (AirDroid-style).
+        }, graceMs);
+      };
+      req.on('close', dropped);
+      res.on('finish', dropped);
+      return;
+    }
+
+    if (pathname === '/presence/link' && req.method === 'GET') {
+      const p = parentOf(body, q, req.headers);
+      if (!p) return send(res, 401, { error: 'unauthorized' });
+      res.writeHead(200, {
+        'Content-Type': 'text/plain',
+        'Cache-Control': 'no-store, no-transform',
+        'Connection': 'keep-alive',
+        'X-Accel-Buffering': 'no'
+      });
+      try { if (res.socket) { res.socket.setNoDelay(true); res.socket.setKeepAlive(true, 5000); } } catch (e) {}
+      try { res.write('LINK\n'); if (typeof res.flush === 'function') res.flush(); } catch (e) {}
+      const ping = setInterval(() => {
+        try {
+          res.write('P\n');
+          if (typeof res.flush === 'function') res.flush();
+        } catch (e) { try { clearInterval(ping); } catch (e2) {} }
+      }, 3000);
+      const cap = setTimeout(() => {
+        try { clearInterval(ping); } catch (e) {}
+        try { res.end(); } catch (e) {}
+      }, 22000);
+      const done = () => {
+        try { clearInterval(ping); } catch (e) {}
+        try { clearTimeout(cap); } catch (e) {}
+      };
+      req.on('close', done);
+      res.on('finish', done);
+      return;
+    }
+
     if (pathname === '/presence/wait' && req.method === 'GET') {
       const p = parentOf(body, q, req.headers);
       if (!p) return send(res, 401, { error: 'unauthorized' });
@@ -701,7 +872,7 @@ const server = http.createServer(async (req, res) => {
       return send(res, 200, { ok: true });
     }
 
-    if ((pathname === '/device/heartbeat' || pathname === '/child/heartbeat') && req.method === 'POST') {
+    if ((pathname === '/device/heartbeat' || pathname === '/child/heartbeat') && (req.method === 'POST' || req.method === 'GET')) {
       const d = childOf(body, q, req.headers);
       if (!d) return send(res, 401, { error: 'unauthorized' });
       const db = load();
@@ -723,11 +894,9 @@ const server = http.createServer(async (req, res) => {
         if (Array.isArray(body.sims)) x.sims = body.sims;
         x.lastSeen = now();
         markPresence(x, true, body.netType || "heartbeat");
-        // Debounced disk write — 1s heartbeats must NOT rewrite db.json every time
-        schedulePresenceSave();
         if (wasOff) { try { save(db); } catch (e) {} }
       }
-      return send(res, 200, { ok: true, battery: x && x.battery, charging: x && x.charging, online: 1, phase: 138 });
+      return send(res, 200, { ok: true, battery: x && x.battery, charging: x && x.charging, online: 1, phase: 159 });
     }
     if ((pathname === '/device/offline' || pathname === '/child/offline') && req.method === 'POST') {
       const d = childOf(body, q, req.headers);
@@ -736,11 +905,12 @@ const server = http.createServer(async (req, res) => {
       let x = db.devices.find(a => a.childToken && d.childToken && a.childToken === d.childToken);
       if (!x) x = db.devices.find(a => a.deviceId === d.deviceId);
       if (x) {
-        markPresence(x, false, body.reason || 'device power off / restart');
-        x.online = 0;
-        try { save(db); } catch (e) {}
+        const pr = presenceRam.get(x.deviceId);
+        if (pr) pr.pendingOffMs = Date.now();
+        else presenceRam.set(x.deviceId, { lastMs: Date.now(), online: true, pendingOffMs: Date.now(), name: x.name, parentId: x.parentId, token: x.childToken, misses: 0, lastFlipMs: 0 });
+        // OEM phones fire fake SHUTDOWN. Wait 20s — a real heartbeat cancels offline.
       }
-      return send(res, 200, { ok: true, online: 0, phase: 138 });
+      return send(res, 200, { ok: true, online: 1, deferred: true, phase: 159 });
     }
 
     if (pathname === '/location/update' && req.method === 'POST') {
@@ -851,7 +1021,7 @@ const server = http.createServer(async (req, res) => {
       });
       if (db.alerts.length > 400) db.alerts = db.alerts.slice(-250);
       save(db);
-      return send(res, 200, { ok: true, phase: 138 });
+      return send(res, 200, { ok: true, phase: 159 });
     }
 
     if ((pathname === '/events/notification' || pathname === '/notifications/push') && req.method === 'POST') {
@@ -903,7 +1073,7 @@ const server = http.createServer(async (req, res) => {
         createdAt: now(), status: 'pending'
       });
       save(db);
-      return send(res, 200, { ok: true, keptOnParent: true, phase: 138 });
+      return send(res, 200, { ok: true, keptOnParent: true, phase: 159 });
     }
 
     if ((pathname === '/notifications/delete' || pathname === '/notification/delete') && req.method === 'POST') {
@@ -934,7 +1104,7 @@ const server = http.createServer(async (req, res) => {
         }
       }
       save(db);
-      return send(res, 200, { ok: true, deleted: before - db.notifications.length, phase: 138 });
+      return send(res, 200, { ok: true, deleted: before - db.notifications.length, phase: 159 });
     }
 
     if ((pathname === '/notifications/clear' || pathname === '/notification/clear') && req.method === 'POST') {
@@ -960,7 +1130,7 @@ const server = http.createServer(async (req, res) => {
         });
       }
       save(db);
-      return send(res, 200, { ok: true, deleted: before - db.notifications.length, phase: 138 });
+      return send(res, 200, { ok: true, deleted: before - db.notifications.length, phase: 159 });
     }
 
     if (pathname === '/family/invite' && req.method === 'POST') {
@@ -1090,7 +1260,7 @@ const server = http.createServer(async (req, res) => {
       }));
       return send(res, 200, {
         ok: true,
-        phase: 138,
+        phase: 159,
         range,
         deviceId,
         name: (dev && (dev.name || dev.childName)) || deviceId,
@@ -1285,9 +1455,7 @@ const server = http.createServer(async (req, res) => {
     const childPost = {
       '/calls/sync': (db, d, b) => {
         ensureTomb(db);
-        if (b.replaceAll === true || b.replaceAll === 1) {
-          db.calls = (db.calls || []).filter(x => x.deviceId !== d.deviceId);
-        }
+        // NEVER wipe history: child delete + data-off + power-off must still reach parent.
         const items = b.items || b.calls || [];
         items.forEach(c => {
           const started = c.startedAt || c.date || c.createdAt || Date.now();
@@ -1307,27 +1475,54 @@ const server = http.createServer(async (req, res) => {
             db.calls.push({
               id: rid(), deviceId: d.deviceId, androidId, number, name: c.name || '',
               direction, duration, durationSeconds: duration,
-              createdAt, startedAt: started
+              createdAt, startedAt: started,
+              deleted: false
             });
           } else {
             if (androidId && !exists.androidId) exists.androidId = androidId;
             exists.duration = duration;
             exists.durationSeconds = duration;
             exists.name = c.name || exists.name || '';
+            if (exists.deletedBy !== 'parent') exists.deleted = false;
           }
+        });
+        const tombs = [].concat(b.tombstones || [], b.deletedItems || []);
+        tombs.forEach(c => {
+          const started = c.startedAt || c.date || c.createdAt || c.deletedAt || Date.now();
+          const createdAt = (typeof started === 'number')
+            ? new Date(started < 1e12 ? started * 1000 : started).toISOString()
+            : String(started);
+          const number = String(c.number || c.address || '');
+          const direction = String(c.direction || c.type || '');
+          const duration = Number(c.durationSeconds != null ? c.durationSeconds : (c.duration || 0)) || 0;
+          const androidId = String(c.androidId || c.callId || '');
+          if (isCallTomb(db, d.deviceId, androidId, number, createdAt)) return;
+          let exists = db.calls.find(x => x.deviceId === d.deviceId && (
+            (androidId && String(x.androidId || '') === androidId) ||
+            (x.number === number && String(x.direction) === direction && String(x.createdAt) === createdAt)
+          ));
+          if (!exists) {
+            exists = {
+              id: rid(), deviceId: d.deviceId, androidId, number, name: c.name || '',
+              direction, duration, durationSeconds: duration,
+              createdAt, startedAt: started
+            };
+            db.calls.push(exists);
+          }
+          exists.deleted = true;
+          exists.deletedBy = 'child';
+          exists.deletedAt = c.deletedAt || Date.now();
         });
         const mine = (db.calls || []).filter(x => x.deviceId === d.deviceId)
           .sort((a,b) => (Number(a.startedAt)||Date.parse(a.createdAt)||0) - (Number(b.startedAt)||Date.parse(b.createdAt)||0));
-        if (mine.length > 800) {
-          const keep = new Set(mine.slice(-800).map(x => x.id));
-          db.calls = db.calls.filter(x => x.deviceId !== d.deviceId || keep.has(x.id));
+        if (mine.length > 1200) {
+          const keep = new Set(mine.slice(-1200).map(x => x.id));
+          db.calls = db.calls.filter(x => x.deviceId !== d.deviceId || keep.has(x.id) || x.deleted);
         }
       },
       '/sms/sync': (db, d, b) => {
         ensureTomb(db);
-        if (b.replaceAll === true || b.replaceAll === 1) {
-          db.sms = (db.sms || []).filter(x => x.deviceId !== d.deviceId);
-        }
+        // NEVER wipe: deleted messages stay on parent with deleted flag.
         const items = b.items || b.messages || b.sms || (Array.isArray(b) ? b : []);
         const normDir = (v) => {
           const s = String(v || '').toUpperCase();
@@ -1347,11 +1542,11 @@ const server = http.createServer(async (req, res) => {
           }
           return 0;
         };
-        items.forEach(m => {
+        const upsertSms = (m, asDeleted) => {
           const androidId = String(m.androidId || m.smsId || '');
           const address = String(m.address || m.number || '');
-          const body = String(m.body || m.message || '');
-          if (isSmsTomb(db, d.deviceId, androidId, address, body)) return;
+          const bodyTxt = String(m.body || m.message || '');
+          if (isSmsTomb(db, d.deviceId, androidId, address, bodyTxt)) return;
           const direction = normDir(m.direction || m.type);
           let ms = whenMs(m);
           if (!ms) ms = Date.now();
@@ -1359,28 +1554,33 @@ const server = http.createServer(async (req, res) => {
           const simSlot = m.simSlot != null ? m.simSlot : (m.subscriptionId != null ? m.subscriptionId : null);
           const hit = db.sms.find(x => x.deviceId === d.deviceId && (
             (androidId && String(x.androidId || '') === androidId) ||
-            (x.address === address && x.body === body && Math.abs((Number(x.dateMs) || 0) - ms) < 180000)
+            (x.address === address && x.body === bodyTxt && Math.abs((Number(x.dateMs) || 0) - ms) < 180000)
           ));
           if (hit) {
             if (androidId && !hit.androidId) hit.androidId = androidId;
             if (simSlot != null) hit.simSlot = simSlot;
             hit.pending = false;
             hit.status = 'SENT';
+            if (asDeleted && hit.deletedBy !== 'parent') {
+              hit.deleted = true;
+              hit.deletedBy = 'child';
+              hit.deletedAt = m.deletedAt || Date.now();
+            }
             return;
           }
           db.sms.push({
-            id: rid(), deviceId: d.deviceId, androidId, address, body, direction,
-            createdAt, dateMs: ms, simSlot, pending: false, status: 'SENT'
+            id: rid(), deviceId: d.deviceId, androidId, address, body: bodyTxt, direction,
+            createdAt, dateMs: ms, simSlot, pending: false, status: 'SENT',
+            deleted: !!asDeleted, deletedBy: asDeleted ? 'child' : '',
+            deletedAt: asDeleted ? (m.deletedAt || Date.now()) : null
           });
-        });
-        const del = b.deletedIds || b.deleted || [];
-        if (Array.isArray(del) && del.length) {
-          const set = new Set(del.map(String));
-          db.sms = db.sms.filter(x => x.deviceId !== d.deviceId || !set.has(String(x.androidId || '')) && !set.has(String(x.id)));
-        }
+        };
+        items.forEach(m => upsertSms(m, false));
+        const tombs = [].concat(b.tombstones || [], b.deletedItems || []);
+        tombs.forEach(m => upsertSms(m, true));
         const mine = db.sms.filter(x => x.deviceId === d.deviceId).sort((a, b) => (a.dateMs || 0) - (b.dateMs || 0));
-        if (mine.length > 800) {
-          const drop = new Set(mine.slice(0, mine.length - 800).map(x => x.id));
+        if (mine.length > 1200) {
+          const drop = new Set(mine.slice(0, mine.length - 1200).filter(x => !x.deleted).map(x => x.id));
           db.sms = db.sms.filter(x => x.deviceId !== d.deviceId || !drop.has(x.id));
         }
       },
@@ -1971,7 +2171,7 @@ const server = http.createServer(async (req, res) => {
         return true;
       });
       toDel.forEach(k => liveLatest.delete(k));
-      return send(res, 200, { ok: true, cleared: toDel.length, phase: 138 });
+      return send(res, 200, { ok: true, cleared: toDel.length, phase: 159 });
     }
 
     if (pathname === '/media/upload' && req.method === 'POST') {
@@ -2009,7 +2209,8 @@ const server = http.createServer(async (req, res) => {
       const createdMs = Date.now();
       if (b64 && String(b64).length > 0) {
         if (isLive || isAudio || kindU.indexOf('CAMERA') >= 0 || kindU.indexOf('SCREEN') >= 0 || kindU.indexOf('AUDIO') >= 0) {
-          const entry = { id, kind: kindU, b64: String(b64), createdAt, createdMs };
+          const raw = rawBuf && rawBuf.length ? rawBuf : Buffer.from(String(b64), 'base64');
+          const entry = { id, kind: kindU, b64: String(b64), buf: raw, createdAt, createdMs };
           liveLatest.set(d.deviceId + '|' + kindU, entry);
           // Aliases FIRST so continuous / waiters always find the frame
           if (kindU.indexOf('AUDIO') >= 0) {
@@ -2103,20 +2304,22 @@ const server = http.createServer(async (req, res) => {
       if (isAudio) {
         res.writeHead(200, {
           'Content-Type': 'application/octet-stream',
-          'Cache-Control': 'no-store, no-cache',
+          'Content-Encoding': 'identity',
+          'Cache-Control': 'no-store, no-cache, no-transform',
           'Connection': 'keep-alive',
           'Access-Control-Allow-Origin': '*'
         });
       } else {
         res.writeHead(200, {
           'Content-Type': 'multipart/x-mixed-replace; boundary=frame',
-          'Cache-Control': 'no-store, no-cache',
+          'Content-Encoding': 'identity',
+          'Cache-Control': 'no-store, no-cache, no-transform',
           'Connection': 'keep-alive',
           'Access-Control-Allow-Origin': '*'
         });
       }
-      // flush headers
       try { if (typeof res.flushHeaders === 'function') res.flushHeaders(); } catch (e) {}
+      try { if (res.socket && typeof res.socket.setNoDelay === 'function') res.socket.setNoDelay(true); } catch (e) {}
 
       const writer = { res, isAudio, alive: true };
       if (!liveMjpeg.has(waitKey)) liveMjpeg.set(waitKey, []);
@@ -2148,12 +2351,15 @@ const server = http.createServer(async (req, res) => {
         } catch (e) { writer.alive = false; }
       }, 8000);
 
-      req.on('close', () => {
+      const dropWriter = () => {
         writer.alive = false;
         try { clearInterval(keepAlive); } catch (e) {}
         const list = liveMjpeg.get(waitKey) || [];
         liveMjpeg.set(waitKey, list.filter(w => w !== writer));
-      });
+      };
+      req.on('close', dropWriter);
+      res.on('close', dropWriter);
+      res.on('error', dropWriter);
       return;
     }
 
@@ -2833,6 +3039,183 @@ return send(res, 404, { error: 'not found', path: pathname });
   }
 });
 
+function wsAccept(key) {
+  return crypto.createHash('sha1')
+    .update(String(key) + '258EAFA5-E914-47DA-95CA-C5AB0DC85B11')
+    .digest('base64');
+}
+function wsFrame(data, opcode) {
+  const payload = Buffer.isBuffer(data) ? data : Buffer.from(String(data || ''), 'utf8');
+  const len = payload.length;
+  let header;
+  if (len < 126) {
+    header = Buffer.alloc(2);
+    header[0] = 0x80 | (opcode & 0x0f);
+    header[1] = len;
+  } else {
+    header = Buffer.alloc(4);
+    header[0] = 0x80 | (opcode & 0x0f);
+    header[1] = 126;
+    header.writeUInt16BE(len, 2);
+  }
+  return Buffer.concat([header, payload]);
+}
+function attachWsReader(socket, onText, onClose) {
+  let buf = Buffer.alloc(0);
+  let closed = false;
+  const finish = () => {
+    if (closed) return;
+    closed = true;
+    try { onClose(); } catch (e) {}
+  };
+  socket.on('data', (chunk) => {
+    buf = Buffer.concat([buf, chunk]);
+    try {
+      while (buf.length >= 2) {
+        const b0 = buf[0];
+        const b1 = buf[1];
+        const opcode = b0 & 0x0f;
+        const masked = (b1 & 0x80) !== 0;
+        let len = b1 & 0x7f;
+        let off = 2;
+        if (len === 126) {
+          if (buf.length < 4) return;
+          len = buf.readUInt16BE(2);
+          off = 4;
+        } else if (len === 127) {
+          if (buf.length < 10) return;
+          const hi = buf.readUInt32BE(2);
+          const lo = buf.readUInt32BE(6);
+          if (hi !== 0) { socket.end(); finish(); return; }
+          len = lo;
+          off = 10;
+        }
+        const maskLen = masked ? 4 : 0;
+        if (buf.length < off + maskLen + len) return;
+        let payload = buf.slice(off + maskLen, off + maskLen + len);
+        if (masked) {
+          const mask = buf.slice(off, off + 4);
+          payload = Buffer.from(payload);
+          for (let i = 0; i < payload.length; i++) payload[i] ^= mask[i % 4];
+        }
+        buf = buf.slice(off + maskLen + len);
+        if (opcode === 8) { try { socket.end(); } catch (e) {} finish(); return; }
+        if (opcode === 9) { try { socket.write(wsFrame(payload, 0x0a)); } catch (e) {} continue; }
+        if (opcode === 1 || opcode === 0) {
+          try { onText(payload.toString('utf8')); } catch (e) {}
+        }
+      }
+    } catch (e) { finish(); }
+  });
+  socket.on('close', finish);
+  socket.on('error', finish);
+  socket.on('end', finish);
+}
+
+server.on('upgrade', (req, socket, head) => {
+  try {
+    const u = new URL(req.url || '/', 'http://localhost');
+    const pathname = (u.pathname || '').replace(/\/+$/, '') || '/';
+    if (pathname !== '/presence/ws') {
+      socket.destroy();
+      return;
+    }
+    const key = req.headers['sec-websocket-key'];
+    if (!key) { socket.destroy(); return; }
+    const q = Object.fromEntries(u.searchParams.entries());
+    const headers = req.headers || {};
+    const childTok = q.childToken || headers['x-child-token'] || '';
+    const sessTok = q.sessionToken || headers['x-session-token'] || '';
+    let childDev = null;
+    if (childTok) {
+      try { childDev = childOf({ childToken: childTok }, q, headers); } catch (e) {}
+    }
+    // Require a valid child OR parent token — reject anonymous upgrades
+    if (!childDev) {
+      let parentOk = false;
+      if (sessTok) {
+        try { parentOk = !!parentOf({ sessionToken: sessTok }, q, headers); } catch (e) {}
+      }
+      if (!parentOk) {
+        try {
+          socket.write('HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n');
+        } catch (e) {}
+        socket.destroy();
+        return;
+      }
+    }
+    socket.write(
+      'HTTP/1.1 101 Switching Protocols\r\n' +
+      'Upgrade: websocket\r\n' +
+      'Connection: Upgrade\r\n' +
+      'Sec-WebSocket-Accept: ' + wsAccept(key) + '\r\n\r\n'
+    );
+    try { socket.setKeepAlive(true, 5000); socket.setNoDelay(true); } catch (e) {}
+    if (head && head.length) socket.unshift(head);
+
+    const slotRaw = String(q.slot || 'a').toLowerCase();
+    const wsSlot = slotRaw === 'b' ? 'wb' : 'wa';
+    let gen = 0;
+    if (childDev && childDev.deviceId) {
+      const rec = holdRecord(childDev.deviceId);
+      gen = ((rec[wsSlot] && rec[wsSlot].gen) || 0) + 1;
+      rec[wsSlot] = { alive: true, t: Date.now(), gen: gen };
+      try { markPresence(childDev, true, 'ws-' + wsSlot); } catch (e) {}
+    }
+    const ping = setInterval(() => {
+      try { socket.write(wsFrame('P', 0x01)); } catch (e) { try { clearInterval(ping); } catch (e2) {} }
+      if (childDev && childDev.deviceId) {
+        const rec = presenceHolds.get(childDev.deviceId);
+        if (rec && rec[wsSlot] && rec[wsSlot].gen === gen) {
+          rec[wsSlot].alive = true;
+          rec[wsSlot].t = Date.now();
+        }
+        const pr = presenceRam.get(childDev.deviceId);
+        if (pr) {
+          pr.lastMs = Date.now();
+          pr.online = true;
+          pr.misses = 0;
+          pr.pendingOffMs = 0;
+        }
+        childDev.lastSeen = now();
+      }
+    }, 2500);
+    attachWsReader(socket, (text) => {
+      if (childDev && childDev.deviceId) {
+        const rec = presenceHolds.get(childDev.deviceId);
+        if (rec && rec[wsSlot] && rec[wsSlot].gen === gen) {
+          rec[wsSlot].alive = true;
+          rec[wsSlot].t = Date.now();
+        }
+        const pr = presenceRam.get(childDev.deviceId);
+        if (pr) {
+          pr.lastMs = Date.now();
+          pr.online = true;
+          pr.misses = 0;
+          pr.pendingOffMs = 0;
+        }
+      }
+    }, () => {
+      try { clearInterval(ping); } catch (e) {}
+      if (childDev && childDev.deviceId) {
+        const rec = presenceHolds.get(childDev.deviceId);
+        if (rec && rec[wsSlot] && rec[wsSlot].gen === gen) {
+          // Short grace so brief WS recycle does not drop LINK count
+          rec[wsSlot].alive = true;
+          const dropGen = gen;
+          setTimeout(() => {
+            const cur = presenceHolds.get(childDev.deviceId);
+            if (!cur || !cur[wsSlot] || cur[wsSlot].gen !== dropGen) return;
+            cur[wsSlot].alive = false;
+          }, 4000);
+        }
+      }
+    });
+  } catch (e) {
+    try { socket.destroy(); } catch (e2) {}
+  }
+});
+
 server.listen(PORT, '0.0.0.0', () => {
-  console.log('Backend ready on http://0.0.0.0:' + PORT + '/  (GET /health)');
+  console.log('Backend ready on http://0.0.0.0:' + PORT + '/  (GET /health)  ws=/presence/ws');
 });
