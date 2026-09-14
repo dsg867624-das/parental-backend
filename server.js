@@ -23,8 +23,11 @@ let presenceDirty = false;
 let presenceSaveTimer = null;
 // Was 8s — caused ONLINE/OFFLINE flapping on mobile even with good internet.
 // Child heartbeats ~2.5s; allow long grace so brief net blips do not flip status.
-const ONLINE_MS = 45000; // 45s without heartbeat → OFFLINE
-const PRESENCE_FLIP_COOLDOWN_MS = 8000; // min time between online↔offline alerts
+// Sticky presence — AirDroid-style: do not flap on brief mobile blips
+const ONLINE_MS = 180000; // 3 min soft window without signal
+const ONLINE_HARD_MS = 300000; // 5 min hard offline
+const PRESENCE_FLIP_COOLDOWN_MS = 120000; // presence alerts max every 2 min
+const OFFLINE_MISS_NEEDED = 4; // consecutive sweep misses before offline
 
 function ensureTomb(db) {
   if (!db.deletedSms) db.deletedSms = [];
@@ -136,7 +139,8 @@ function markPresence(d, online, reason) {
     name: d.name,
     parentId: d.parentId,
     token: d.childToken,
-    lastFlipMs: (!!was !== !!online) ? nowMs : lastFlip
+    lastFlipMs: (!!was !== !!online) ? nowMs : lastFlip,
+    misses: online ? 0 : (prev && prev.misses ? prev.misses : 0)
   });
   if (!!was !== !!online) {
     const db = load();
@@ -172,24 +176,36 @@ function sweepPresence() {
     for (const d of (db.devices || [])) {
       if (!d || !d.deviceId) continue;
       const pr = presenceRam.get(d.deviceId);
-      let lastMs = pr ? pr.lastMs : 0;
+      let lastMs = pr ? (pr.lastMs || 0) : 0;
       if (!lastMs && d.lastSeen) {
         lastMs = Date.parse(String(d.lastSeen)) || 0;
       }
-      const isOn = lastMs > 0 && (nowMs - lastMs) < ONLINE_MS;
+      const age = lastMs > 0 ? (nowMs - lastMs) : 99999999;
+      const softOn = lastMs > 0 && age < ONLINE_MS;
+      const hardOff = lastMs <= 0 || age >= ONLINE_HARD_MS;
       const was = pr ? !!pr.online : !!d.online;
-      if (!pr) {
-        presenceRam.set(d.deviceId, { lastMs: lastMs || 0, online: isOn, name: d.name, parentId: d.parentId, token: d.childToken });
-      }
-      if (was && !isOn) {
-        markPresence(d, false, "heartbeat timeout");
+      let misses = pr && typeof pr.misses === 'number' ? pr.misses : 0;
+      if (softOn) misses = 0;
+      else if (was) misses += 1;
+      presenceRam.set(d.deviceId, {
+        lastMs: lastMs || 0,
+        online: was && (softOn || (!hardOff && misses < OFFLINE_MISS_NEEDED)) ? true : (softOn ? true : false),
+        name: d.name,
+        parentId: d.parentId,
+        token: d.childToken,
+        misses: misses,
+        lastFlipMs: pr && pr.lastFlipMs ? pr.lastFlipMs : 0
+      });
+      // Stay ONLINE through blips; only offline after hard timeout OR enough consecutive misses
+      if (was && (hardOff || (!softOn && misses >= OFFLINE_MISS_NEEDED))) {
+        markPresence(d, false, hardOff ? "hard timeout" : "missed heartbeats");
         changed = true;
       }
     }
     if (changed) schedulePresenceSave();
-  } catch (e) {}
+  } catch (e) { console.error('sweepPresence', e); }
 }
-setInterval(sweepPresence, 5000);
+setInterval(sweepPresence, 10000);
 
 const DATA = path.join(__dirname, 'data');
 const MEDIA = path.join(__dirname, 'media');
@@ -405,7 +421,30 @@ function parentOf(body, q, headers) {
 function childOf(body, q, headers) {
   const t = (body && body.childToken) || q.childToken || (headers && headers['x-child-token']) || bearerToken(headers);
   if (!t) return null;
-  return load().devices.find(d => d.childToken === t) || null;
+  const d = load().devices.find(x => x.childToken === t) || null;
+  // Any successful child API counts as presence (AirDroid-style sticky online)
+  if (d && d.deviceId) {
+    try {
+      const nowMs = Date.now();
+      const prev = presenceRam.get(d.deviceId);
+      presenceRam.set(d.deviceId, {
+        lastMs: nowMs,
+        online: true,
+        name: d.name,
+        parentId: d.parentId,
+        token: d.childToken,
+        lastFlipMs: prev && prev.lastFlipMs ? prev.lastFlipMs : 0,
+        misses: 0
+      });
+      d.lastSeen = now();
+      d.online = 1;
+      // Only alert if was offline
+      if (prev && prev.online === false) {
+        markPresence(d, true, "api activity");
+      }
+    } catch (e) {}
+  }
+  return d;
 }
 
 const server = http.createServer(async (req, res) => {
@@ -415,7 +454,7 @@ const server = http.createServer(async (req, res) => {
     let pathname = u.pathname.replace(/\/+$/, '') || '/';
     // Health FIRST - never block on body/db
     if (pathname === '/health' || pathname === '/') {
-      return send(res, 200, { ok: true, phase: 106, store: 'json-file', web: true, snapshots: true, recordings: true, sms: true, map: true, live: true, liveFix: true, gallery: true, files: true, music: true });
+      return send(res, 200, { ok: true, phase: 138, store: 'json-file', web: true, snapshots: true, recordings: true, sms: true, map: true, live: true, liveFix: true, gallery: true, files: true, music: true });
     }
     const q = Object.fromEntries(u.searchParams.entries());
     let body = {};
@@ -610,7 +649,7 @@ const server = http.createServer(async (req, res) => {
         };
       });
       if (dirty) { try { save(db); } catch (e) {} }
-      return send(res, 200, { devices: list, phase: 106 });
+      return send(res, 200, { devices: list, phase: 138 });
     }
 
     if ((pathname === '/presence' || pathname === '/presence/status') && req.method === 'GET') {
@@ -634,7 +673,7 @@ const server = http.createServer(async (req, res) => {
           battery: d.battery, charging: d.charging ? 1 : 0, netType: d.netType || ''
         };
       });
-      return send(res, 200, { ok: true, devices, ts: nowMs, onlineMs: ONLINE_MS, phase: 106 });
+      return send(res, 200, { ok: true, devices, ts: nowMs, onlineMs: ONLINE_MS, phase: 138 });
     }
     if (pathname === '/presence/wait' && req.method === 'GET') {
       const p = parentOf(body, q, req.headers);
@@ -688,7 +727,7 @@ const server = http.createServer(async (req, res) => {
         schedulePresenceSave();
         if (wasOff) { try { save(db); } catch (e) {} }
       }
-      return send(res, 200, { ok: true, battery: x && x.battery, charging: x && x.charging, online: 1, phase: 106 });
+      return send(res, 200, { ok: true, battery: x && x.battery, charging: x && x.charging, online: 1, phase: 138 });
     }
     if ((pathname === '/device/offline' || pathname === '/child/offline') && req.method === 'POST') {
       const d = childOf(body, q, req.headers);
@@ -701,7 +740,7 @@ const server = http.createServer(async (req, res) => {
         x.online = 0;
         try { save(db); } catch (e) {}
       }
-      return send(res, 200, { ok: true, online: 0, phase: 106 });
+      return send(res, 200, { ok: true, online: 0, phase: 138 });
     }
 
     if (pathname === '/location/update' && req.method === 'POST') {
@@ -812,7 +851,7 @@ const server = http.createServer(async (req, res) => {
       });
       if (db.alerts.length > 400) db.alerts = db.alerts.slice(-250);
       save(db);
-      return send(res, 200, { ok: true, phase: 106 });
+      return send(res, 200, { ok: true, phase: 138 });
     }
 
     if ((pathname === '/events/notification' || pathname === '/notifications/push') && req.method === 'POST') {
@@ -822,7 +861,9 @@ const server = http.createServer(async (req, res) => {
       if (!db.notifications) db.notifications = [];
       db.notifications.push({
         id: rid(), deviceId: d.deviceId, parentId: d.parentId,
-        packageName: body.packageName || '', title: body.title || '',
+        packageName: body.packageName || '',
+        appName: body.appName || body.packageName || '',
+        title: body.title || '',
         text: body.text || body.body || '', when: body.when || Date.now(),
         key: body.key || '', createdAt: now()
       });
@@ -834,11 +875,92 @@ const server = http.createServer(async (req, res) => {
       // also parent alert for quick poll
       db.alerts.push({
         id: rid(), deviceId: d.deviceId, parentId: d.parentId,
-        type: 'NOTIFICATION', message: (body.title || body.packageName || 'Notification') + ': ' + String(body.text || body.body || '').slice(0, 80),
+        type: 'NOTIFICATION', title: (body.appName || body.packageName || 'App') + ': ' + (body.title || 'Notification'), message: String(body.text || body.body || '').slice(0, 120),
         createdAt: now()
       });
       save(db);
       return send(res, 200, { ok: true });
+    }
+
+
+    // Parent deletes mirrored notification(s)
+
+    // Dismiss on child only — parent history stays saved
+    if ((pathname === '/notifications/dismiss-child' || pathname === '/notification/dismiss') && req.method === 'POST') {
+      const p = parentOf(body, q, req.headers);
+      if (!p) return send(res, 401, { error: 'unauthorized' });
+      const deviceId = String(body.deviceId || '');
+      const key = body.key || '';
+      const pkg = body.packageName || '';
+      if (!deviceId) return send(res, 400, { error: 'deviceId required' });
+      const db = load();
+      const dev = (db.devices || []).find(d => d.deviceId === deviceId && d.parentId === p.id);
+      if (!dev) return send(res, 404, { error: 'device not found' });
+      if (!db.commands) db.commands = [];
+      db.commands.push({
+        id: rid(), deviceId, parentId: p.id, command: 'notification_cancel',
+        payload: { key, packageName: pkg, id: body.id || '' },
+        createdAt: now(), status: 'pending'
+      });
+      save(db);
+      return send(res, 200, { ok: true, keptOnParent: true, phase: 138 });
+    }
+
+    if ((pathname === '/notifications/delete' || pathname === '/notification/delete') && req.method === 'POST') {
+      const p = parentOf(body, q, req.headers);
+      if (!p) return send(res, 401, { error: 'unauthorized' });
+      const id = String(body.id || body.notificationId || '');
+      const deviceId = String(body.deviceId || '');
+      const db = load();
+      if (!db.notifications) db.notifications = [];
+      const before = db.notifications.length;
+      db.notifications = db.notifications.filter(n => {
+        if (id && String(n.id) === id) return false;
+        return true;
+      });
+      // Optional: queue cancel on child
+      const alsoChild = body.deleteOnChild === true || body.deleteOnChild === 1 || body.deleteOnChild === '1';
+      const key = body.key || '';
+      const pkg = body.packageName || '';
+      if (alsoChild && deviceId && (key || pkg)) {
+        if (!db.commands) db.commands = [];
+        const dev = (db.devices || []).find(d => d.deviceId === deviceId && d.parentId === p.id);
+        if (dev) {
+          db.commands.push({
+            id: rid(), deviceId, parentId: p.id, command: 'notification_cancel',
+            payload: { key, packageName: pkg, id },
+            createdAt: now(), status: 'pending'
+          });
+        }
+      }
+      save(db);
+      return send(res, 200, { ok: true, deleted: before - db.notifications.length, phase: 138 });
+    }
+
+    if ((pathname === '/notifications/clear' || pathname === '/notification/clear') && req.method === 'POST') {
+      const p = parentOf(body, q, req.headers);
+      if (!p) return send(res, 401, { error: 'unauthorized' });
+      const deviceId = String(body.deviceId || '');
+      const db = load();
+      if (!db.notifications) db.notifications = [];
+      const before = db.notifications.length;
+      db.notifications = db.notifications.filter(n => {
+        if (deviceId && n.deviceId !== deviceId) return true;
+        if (n.parentId && n.parentId !== p.id) return true;
+        // keep other parents/devices
+        if (deviceId) return n.deviceId !== deviceId;
+        return n.parentId !== p.id;
+      });
+      const alsoChild = body.deleteOnChild === true || body.deleteOnChild === 1 || body.deleteOnChild === '1';
+      if (alsoChild && deviceId) {
+        if (!db.commands) db.commands = [];
+        db.commands.push({
+          id: rid(), deviceId, parentId: p.id, command: 'notification_cancel_all',
+          payload: {}, createdAt: now(), status: 'pending'
+        });
+      }
+      save(db);
+      return send(res, 200, { ok: true, deleted: before - db.notifications.length, phase: 138 });
     }
 
     if (pathname === '/family/invite' && req.method === 'POST') {
@@ -874,6 +996,121 @@ const server = http.createServer(async (req, res) => {
       // share devices: use linked parent id for device list
       save(db);
       return send(res, 200, { sessionToken: row.sessionToken, email: row.email, familyCode: row.familyCode, multiParent: true });
+    }
+
+
+    if (pathname === '/reports/daily' && (req.method === 'GET' || req.method === 'POST')) {
+      const p = parentOf(body, q, req.headers);
+      if (!p) return send(res, 401, { error: 'unauthorized' });
+      const deviceId = q.deviceId || body.deviceId;
+      if (!deviceId) return send(res, 400, { error: 'deviceId required' });
+      const db = load();
+      const dev = (db.devices || []).find(d => d.deviceId === deviceId);
+      const range = String(q.range || body.range || 'daily'); // daily | weekly
+      const today = now().slice(0, 10);
+      const days = [];
+      const base = new Date();
+      const nDays = range === 'weekly' ? 7 : 1;
+      for (let i = nDays - 1; i >= 0; i--) {
+        const d = new Date(base.getTime() - i * 86400000);
+        const y = d.getUTCFullYear();
+        const m = String(d.getUTCMonth() + 1).padStart(2, '0');
+        const day = String(d.getUTCDate()).padStart(2, '0');
+        // use local-ish ISO date from server now for today match
+        days.push(d.toISOString().slice(0, 10));
+      }
+      // Prefer calendar day from now() string for "today"
+      if (range === 'daily') {
+        days.length = 0;
+        days.push(today);
+        // also yesterday for compare
+        const yest = new Date(Date.parse(today + 'T12:00:00Z') - 86400000).toISOString().slice(0, 10);
+        var yesterday = yest;
+      } else {
+        var yesterday = null;
+        days.length = 0;
+        for (let i = 6; i >= 0; i--) {
+          const d = new Date(Date.parse(today + 'T12:00:00Z') - i * 86400000);
+          days.push(d.toISOString().slice(0, 10));
+        }
+      }
+      const usageAll = (db.usage || []).filter(u => u.deviceId === deviceId);
+      const notifAll = (db.notifications || []).filter(n => n.deviceId === deviceId);
+      const dataAll = (db.dataUsage || []).filter(x => x.deviceId === deviceId);
+      function dayUsage(day) {
+        return usageAll.filter(u => String(u.day || '').slice(0, 10) === day);
+      }
+      function sumSec(list) {
+        return list.reduce((s, u) => s + (Number(u.seconds || u.foregroundSeconds) || 0), 0);
+      }
+      function topApps(list, n) {
+        const map = {};
+        list.forEach(u => {
+          const k = u.packageName || 'unknown';
+          if (!map[k]) map[k] = { packageName: k, appLabel: u.appLabel || k, seconds: 0 };
+          map[k].seconds += Number(u.seconds || u.foregroundSeconds) || 0;
+          if (u.appLabel) map[k].appLabel = u.appLabel;
+        });
+        return Object.keys(map).map(k => map[k]).sort((a, b) => b.seconds - a.seconds).slice(0, n || 12);
+      }
+      function notifCount(day) {
+        return notifAll.filter(n => {
+          const t = n.when || Date.parse(n.createdAt || '') || 0;
+          const ds = (typeof t === 'number' ? new Date(t) : new Date(Date.parse(String(t)))).toISOString().slice(0, 10);
+          return ds === day || String(n.createdAt || '').slice(0, 10) === day;
+        }).length;
+      }
+      function dataFor(day) {
+        const row = dataAll.find(x => String(x.day || '').slice(0, 10) === day);
+        return row || { mobileBytes: 0, wifiBytes: 0, day };
+      }
+      const focusDay = range === 'weekly' ? null : today;
+      const todayUsage = dayUsage(today);
+      const yestUsage = yesterday ? dayUsage(yesterday) : [];
+      const weekUsage = range === 'weekly' ? usageAll.filter(u => days.indexOf(String(u.day || '').slice(0, 10)) >= 0) : todayUsage;
+      const totalSec = sumSec(range === 'weekly' ? weekUsage : todayUsage);
+      const yestSec = sumSec(yestUsage);
+      const apps = topApps(range === 'weekly' ? weekUsage : todayUsage, 15);
+      const notifToday = notifCount(today);
+      const notifYest = yesterday ? notifCount(yesterday) : 0;
+      let notifWeek = 0;
+      if (range === 'weekly') days.forEach(d => { notifWeek += notifCount(d); });
+      const dataToday = dataFor(today);
+      const dataYest = yesterday ? dataFor(yesterday) : { mobileBytes: 0, wifiBytes: 0 };
+      // hourly buckets empty placeholder (no hourly data stored)
+      const hourly = [];
+      for (let h = 0; h < 24; h++) hourly.push({ hour: h, seconds: 0 });
+      // per-day series for weekly chart
+      const series = days.map(d => ({
+        day: d,
+        screenSeconds: sumSec(dayUsage(d)),
+        notifications: notifCount(d),
+        mobileBytes: (dataFor(d).mobileBytes || 0),
+        wifiBytes: (dataFor(d).wifiBytes || 0)
+      }));
+      return send(res, 200, {
+        ok: true,
+        phase: 138,
+        range,
+        deviceId,
+        name: (dev && (dev.name || dev.childName)) || deviceId,
+        today,
+        yesterday: yesterday || null,
+        screenTimeSeconds: totalSec,
+        screenTimeYesterdaySeconds: yestSec,
+        notifications: range === 'weekly' ? notifWeek : notifToday,
+        notificationsYesterday: notifYest,
+        topApps: apps,
+        dataUsage: {
+          mobileBytes: dataToday.mobileBytes || 0,
+          wifiBytes: dataToday.wifiBytes || 0,
+          yesterdayMobileBytes: dataYest.mobileBytes || 0,
+          yesterdayWifiBytes: dataYest.wifiBytes || 0
+        },
+        series,
+        hourly,
+        updatedAt: now()
+      });
     }
 
     if (pathname === '/reports/weekly' && req.method === 'GET') {
@@ -1359,6 +1596,12 @@ const server = http.createServer(async (req, res) => {
       if (incoming.scheduleScreenIntervalMin != null) incoming.schedule_screen_interval_min = incoming.scheduleScreenIntervalMin;
       if (incoming.scheduleCameraIntervalMin != null) incoming.schedule_camera_interval_min = incoming.scheduleCameraIntervalMin;
       if (incoming.scheduleCameraFacing) incoming.schedule_camera_facing = incoming.scheduleCameraFacing;
+      if (incoming.scheduleScreenDays != null) incoming.schedule_screen_days = incoming.scheduleScreenDays;
+      if (incoming.scheduleCameraDays != null) incoming.schedule_camera_days = incoming.scheduleCameraDays;
+      if (incoming.scheduleScreenStartMin != null) incoming.schedule_screen_start_min = incoming.scheduleScreenStartMin;
+      if (incoming.scheduleScreenEndMin != null) incoming.schedule_screen_end_min = incoming.scheduleScreenEndMin;
+      if (incoming.scheduleCameraStartMin != null) incoming.schedule_camera_start_min = incoming.scheduleCameraStartMin;
+      if (incoming.scheduleCameraEndMin != null) incoming.schedule_camera_end_min = incoming.scheduleCameraEndMin;
       delete incoming.sessionToken;
       delete incoming.deviceId;
       d.settings = Object.assign({}, d.settings || {}, incoming);
@@ -1438,8 +1681,11 @@ const server = http.createServer(async (req, res) => {
       if (!deviceId || !number) return send(res, 400, { error: 'number required' });
       const db = load();
       const simSlot = body.simSlot != null ? body.simSlot : null;
-      const recent = (db.commands || []).some(c => c && c.deviceId === deviceId && c.command === 'place_call'
-        && c.status === 'PENDING' && String((c.payload || {}).number || '') === number);
+      const recent = (db.commands || []).some(c => c && c.deviceId === deviceId
+        && (c.command === 'place_call' || c.command === 'call_place' || c.command === 'make_call')
+        && String((c.payload || {}).number || (c.payload || {}).to || '') === String(number)
+        && (c.status === 'PENDING' || c.status === 'CLAIMED'
+            || (c.createdAt && (Date.now() - new Date(c.createdAt).getTime()) < 20000)));
       if (!recent) {
         db.commands.push({
           id: rid(), deviceId, command: 'place_call',
@@ -1725,7 +1971,7 @@ const server = http.createServer(async (req, res) => {
         return true;
       });
       toDel.forEach(k => liveLatest.delete(k));
-      return send(res, 200, { ok: true, cleared: toDel.length, phase: 106 });
+      return send(res, 200, { ok: true, cleared: toDel.length, phase: 138 });
     }
 
     if (pathname === '/media/upload' && req.method === 'POST') {
