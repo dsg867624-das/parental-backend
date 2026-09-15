@@ -13,7 +13,166 @@ const { URL } = require('url');
 process.on('uncaughtException', (e) => { console.error('uncaught', e); });
 process.on('unhandledRejection', (e) => { console.error('unhandled', e); });
 
+
 const PORT = process.env.PORT || 8080;
+// Optional strongest online LLM (OpenAI-compatible). Set AI_API_KEY + AI_API_URL.
+// Example: AI_API_URL=https://api.openai.com/v1/chat/completions  AI_API_KEY=sk-...
+// Or xAI: AI_API_URL=https://api.x.ai/v1/chat/completions
+const AI_API_KEY = process.env.AI_API_KEY || '';
+const AI_API_URL = process.env.AI_API_URL || '';
+const AI_MODEL = process.env.AI_MODEL || 'gpt-4o-mini';
+
+const webrtcSignals = Object.create(null);
+function webrtcAliasTokens(token) {
+  const keys = [];
+  const t = String(token || '');
+  if (!t) return keys;
+  keys.push(t);
+  try {
+    const db = load();
+    const d = (db.devices || []).find(x =>
+      (x.deviceId && String(x.deviceId) === t) ||
+      (x.childToken && String(x.childToken) === t) ||
+      (x.token && String(x.token) === t)
+    );
+    if (d) {
+      if (d.deviceId && keys.indexOf(String(d.deviceId)) < 0) keys.push(String(d.deviceId));
+      if (d.childToken && keys.indexOf(String(d.childToken)) < 0) keys.push(String(d.childToken));
+    }
+  } catch (e) {}
+  return keys;
+}
+function pushWebRtcSignal(token, signal) {
+  if (!token || signal == null) return;
+  const payload = typeof signal === 'object' ? Object.assign({ ts: Date.now() }, signal) : { ts: Date.now(), raw: signal };
+  const keys = webrtcAliasTokens(token);
+  for (const t of keys) {
+    if (!webrtcSignals[t]) webrtcSignals[t] = [];
+    webrtcSignals[t].push(payload);
+    if (webrtcSignals[t].length > 50) webrtcSignals[t] = webrtcSignals[t].slice(-50);
+  }
+}
+function drainWebRtcSignals(token) {
+  const keys = webrtcAliasTokens(token);
+  const out = [];
+  for (const t of keys) {
+    const arr = webrtcSignals[t] || [];
+    webrtcSignals[t] = [];
+    for (const s of arr) out.push(s);
+  }
+  return out;
+}
+
+
+function localStrongClassify(text) {
+  const t = String(text || '');
+  const low = t.toLowerCase();
+  const hits = [];
+  const rules = [
+    { id: 'LOVE', risk: 70, re: /(i love you|love you|miss you|pyar|mohabbat|bhalobashi|saranghae|사랑|ভালোবাসি|प्यार)/i },
+    { id: 'MEET', risk: 75, re: /(meet me|let'?s meet|aa jao|milte|come over|밀나|দেখা)/i },
+    { id: 'LOCATION', risk: 65, re: /(where are you|where are you going|kahan|kidhar|location|address|কোথায়|어디)/i },
+    { id: 'IDENTITY', risk: 40, re: /(who are you|who is this|tum kaun|kaun ho|তুমি কে|누구)/i },
+    { id: 'SECRECY', risk: 80, re: /(don'?t tell|delete this|keep secret|mat batana|kisi ko mat|গোপন)/i },
+    { id: 'THREAT', risk: 90, re: /(kill|suicide|self harm|threaten|marunga)/i },
+    { id: 'SEXUAL', risk: 85, re: /(nudes?|sext|porn|onlyfans|\bsex\b)/i },
+    { id: 'DRUGS', risk: 85, re: /(weed|cocaine|ganja|drugs?)/i },
+    { id: 'WELLBEING', risk: 15, re: /(how are you|i'?m fine|kaise ho|kemon acho)/i },
+    { id: 'FLIRT', risk: 35, re: /(cute|handsome|beautiful|sweetheart)/i }
+  ];
+  for (const r of rules) {
+    if (r.re.test(t) || r.re.test(low)) hits.push({ intent: r.id, risk: r.risk });
+  }
+  let risk = 0;
+  const intents = [];
+  for (const h of hits) {
+    intents.push(h.intent);
+    if (h.risk > risk) risk = h.risk;
+  }
+  const style = [];
+  if (/(please|pls|plz)/i.test(t)) style.push('polite');
+  if (/(lol|haha|😂|🤣)/i.test(t)) style.push('playful');
+  if (/(urgent|now|jaldi|abhi)/i.test(t)) style.push('urgent');
+  if (/(secret|gopan|raaz)/i.test(t)) style.push('secretive');
+  if (t.length > 120) style.push('long_message');
+  if (/[\u0900-\u097F]/.test(t)) style.push('hindi_script');
+  if (/[\u0980-\u09FF]/.test(t)) style.push('bengali_script');
+  if (/[\uAC00-\uD7AF]/.test(t)) style.push('korean_script');
+  return {
+    intents: intents.length ? intents : ['GENERAL_CHAT'],
+    risk: intents.length ? risk : 5,
+    style,
+    summary: intents.length
+      ? ('Detected: ' + intents.join(', ') + (style.length ? (' | style: ' + style.join(',')) : ''))
+      : 'Casual chat',
+    engine: 'local-strong'
+  };
+}
+
+async function llmAnalyze(text, meta) {
+  if (!AI_API_KEY || !AI_API_URL) return null;
+  const system = `You are a parental-control conversation analyst. Analyze the child's message for safety.
+Return STRICT JSON only:
+{"intents":["LOVE|MEET|LOCATION|IDENTITY|SECRECY|THREAT|SEXUAL|DRUGS|BULLYING|WELLBEING|FLIRT|GENERAL_CHAT"],"risk":0-100,"style":["string"],"summary":"one short sentence for parent","languages":["en|hi|bn|ko|other"]}
+Detect meaning even if slang, romanized Hindi/Bengali, or mixed languages. Be sensitive to meetups, secrecy, self-harm, sexual content.`;
+  const user = `App: ${meta.packageName || '?'} | Source: ${meta.source || '?'} | Contact: ${meta.contact || '?'}
+Message: ${String(text).slice(0, 1500)}`;
+  try {
+    const body = {
+      model: AI_MODEL,
+      temperature: 0.1,
+      messages: [
+        { role: 'system', content: system },
+        { role: 'user', content: user }
+      ]
+    };
+    const res = await fetch(AI_API_URL, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': 'Bearer ' + AI_API_KEY
+      },
+      body: JSON.stringify(body)
+    });
+    if (!res.ok) return null;
+    const data = await res.json();
+    let content = '';
+    if (data.choices && data.choices[0] && data.choices[0].message) content = data.choices[0].message.content || '';
+    else if (data.output_text) content = data.output_text;
+    content = String(content).trim();
+    const m = content.match(/\{[\s\S]*\}/);
+    if (!m) return null;
+    const parsed = JSON.parse(m[0]);
+    return {
+      intents: Array.isArray(parsed.intents) ? parsed.intents : ['GENERAL_CHAT'],
+      risk: Math.max(0, Math.min(100, Number(parsed.risk) || 0)),
+      style: Array.isArray(parsed.style) ? parsed.style : [],
+      summary: String(parsed.summary || '').slice(0, 240),
+      languages: Array.isArray(parsed.languages) ? parsed.languages : [],
+      engine: 'llm:' + AI_MODEL
+    };
+  } catch (e) {
+    return null;
+  }
+}
+
+async function onlineAiAnalyze(text, meta) {
+  const local = localStrongClassify(text);
+  const llm = await llmAnalyze(text, meta || {});
+  if (!llm) return local;
+  // Merge: take higher risk, union intents
+  const intents = Array.from(new Set([].concat(llm.intents || [], local.intents || [])));
+  return {
+    intents,
+    risk: Math.max(local.risk || 0, llm.risk || 0),
+    style: Array.from(new Set([].concat(llm.style || [], local.style || []))),
+    summary: llm.summary || local.summary,
+    languages: llm.languages || [],
+    engine: llm.engine + '+local'
+  };
+}
+
+
 
 // ===== Presence (AirDroid-style online/offline in ~1s) =====
 // Heartbeats update RAM instantly; disk save is debounced so Railway does not hang.
@@ -1052,6 +1211,152 @@ const server = http.createServer(async (req, res) => {
       return send(res, 200, { ok: true });
     }
 
+    // ===== Communication AI alerts / weekly report =====
+    if (pathname === '/comm/alert' && req.method === 'POST') {
+      const d = childOf(body, q, req.headers);
+      if (!d) return send(res, 401, { error: 'unauthorized' });
+      const db = load();
+      if (!db.commAlerts) db.commAlerts = [];
+      const row = {
+        id: rid(), deviceId: d.deviceId, parentId: d.parentId,
+        type: body.type || 'COMM',
+        message: String(body.message || '').slice(0, 300),
+        risk: Number(body.risk || 0),
+        packageName: body.packageName || '',
+        contact: body.contact || '',
+        title: String(body.title || '').slice(0, 120),
+        text: String(body.text || '').slice(0, 300),
+        source: body.source || '',
+        isGroup: !!body.isGroup,
+        keyword: body.keyword || '',
+        category: body.category || '',
+        intent: body.intent || '',
+        intentLang: body.intentLang || '',
+        intentPhrase: body.intentPhrase || '',
+        createdAt: now()
+      };
+      db.commAlerts.push(row);
+      const mine = db.commAlerts.filter(n => n.deviceId === d.deviceId);
+      if (mine.length > 500) {
+        const drop = new Set(mine.slice(0, mine.length - 500).map(n => n.id));
+        db.commAlerts = db.commAlerts.filter(n => n.deviceId !== d.deviceId || !drop.has(n.id));
+      }
+      if (!db.alerts) db.alerts = [];
+      db.alerts.push({
+        id: rid(), deviceId: d.deviceId, parentId: d.parentId,
+        type: 'COMM_AI_' + (body.type || 'ALERT'),
+        title: (body.type || 'Comm') + (body.risk ? (' risk ' + body.risk) : ''),
+        message: String(body.message || '').slice(0, 160),
+        createdAt: now()
+      });
+      save(db);
+      return send(res, 200, { ok: true });
+    }
+
+
+    if (pathname === '/comm/ai-analyze' && req.method === 'POST') {
+      const d = childOf(body, q, req.headers);
+      if (!d) return send(res, 401, { error: 'unauthorized' });
+      const text = String(body.text || body.message || '').slice(0, 2000);
+      if (!text || text.length < 2) return send(res, 400, { error: 'text required' });
+      const meta = {
+        packageName: body.packageName || '',
+        source: body.source || '',
+        contact: body.contact || '',
+        title: body.title || ''
+      };
+      try {
+        const result = await onlineAiAnalyze(text, meta);
+        const db = load();
+        if (!db.commAlerts) db.commAlerts = [];
+        const risk = result.risk || 0;
+        // Always store analysis; alert parent when risk meaningful or non-general
+        const interesting = risk >= 25 || (result.intents || []).some(i => i && i !== 'GENERAL_CHAT' && i !== 'WELLBEING');
+        if (interesting) {
+          const row = {
+            id: rid(), deviceId: d.deviceId, parentId: d.parentId,
+            type: 'ONLINE_AI',
+            message: String(result.summary || 'AI detection').slice(0, 300),
+            risk,
+            packageName: meta.packageName,
+            contact: meta.contact,
+            title: meta.title,
+            text: text.slice(0, 400),
+            source: meta.source,
+            intent: (result.intents || []).join(','),
+            intentLang: (result.languages || []).join(','),
+            intentPhrase: text.slice(0, 80),
+            category: 'OnlineAI',
+            engine: result.engine || '',
+            style: (result.style || []).join(','),
+            createdAt: now()
+          };
+          db.commAlerts.push(row);
+          if (!db.alerts) db.alerts = [];
+          db.alerts.push({
+            id: rid(), deviceId: d.deviceId, parentId: d.parentId,
+            type: 'ONLINE_AI',
+            title: 'AI: ' + (result.intents || []).slice(0, 3).join(','),
+            message: String(result.summary || '').slice(0, 160),
+            createdAt: now()
+          });
+          const mine = db.commAlerts.filter(n => n.deviceId === d.deviceId);
+          if (mine.length > 500) {
+            const drop = new Set(mine.slice(0, mine.length - 500).map(n => n.id));
+            db.commAlerts = db.commAlerts.filter(n => n.deviceId !== d.deviceId || !drop.has(n.id));
+          }
+          save(db);
+        }
+        return send(res, 200, { ok: true, ...result });
+      } catch (e) {
+        return send(res, 500, { error: 'ai_failed', detail: String(e && e.message || e) });
+      }
+    }
+
+    if (pathname === '/comm/report' && req.method === 'POST') {
+      const d = childOf(body, q, req.headers);
+      if (!d) return send(res, 401, { error: 'unauthorized' });
+      const db = load();
+      if (!db.commReports) db.commReports = [];
+      db.commReports.push({
+        id: rid(), deviceId: d.deviceId, parentId: d.parentId,
+        summary: body.aiSummary || '',
+        events: body.events || 0,
+        socialEvents: body.socialEvents || 0,
+        nightEvents: body.nightEvents || 0,
+        riskyEvents: body.riskyEvents || 0,
+        directEvents: body.directEvents || 0,
+        groupEvents: body.groupEvents || 0,
+        topApps: body.topApps || {},
+        topContacts: body.topContacts || {},
+        createdAt: now()
+      });
+      if (db.commReports.length > 200) db.commReports = db.commReports.slice(-150);
+      save(db);
+      return send(res, 200, { ok: true });
+    }
+
+    if (pathname === '/comm/alerts' && req.method === 'GET') {
+      const p = parentOf(body, q, req.headers);
+      if (!p) return send(res, 401, { error: 'unauthorized' });
+      const deviceId = String(q.deviceId || body.deviceId || '');
+      const db = load();
+      let rows = (db.commAlerts || []).filter(n => n.parentId === p.id);
+      if (deviceId) rows = rows.filter(n => n.deviceId === deviceId);
+      rows.sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+      return send(res, 200, { alerts: rows.slice(0, 200) });
+    }
+
+    if (pathname === '/comm/reports' && req.method === 'GET') {
+      const p = parentOf(body, q, req.headers);
+      if (!p) return send(res, 401, { error: 'unauthorized' });
+      const deviceId = String(q.deviceId || body.deviceId || '');
+      const db = load();
+      let rows = (db.commReports || []).filter(n => n.parentId === p.id);
+      if (deviceId) rows = rows.filter(n => n.deviceId === deviceId);
+      rows.sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+      return send(res, 200, { reports: rows.slice(0, 50) });
+    }
 
     // Parent deletes mirrored notification(s)
 
@@ -3032,7 +3337,26 @@ const server = http.createServer(async (req, res) => {
       }
     }
 
-return send(res, 404, { error: 'not found', path: pathname });
+
+    if (pathname === '/webrtc/signal/send' && req.method === 'POST') {
+      const targetToken = body.targetToken || body.to || body.deviceId || '';
+      let signal = body.signal != null ? body.signal : body;
+      if (!targetToken) return send(res, 400, { error: 'missing targetToken' });
+      if (signal && typeof signal === 'object' && body.fromToken) {
+        signal = Object.assign({}, signal, { fromToken: body.fromToken });
+      }
+      pushWebRtcSignal(targetToken, signal);
+      return send(res, 200, { ok: true });
+    }
+    if ((pathname === '/webrtc/signal/poll') && (req.method === 'GET' || req.method === 'POST')) {
+      const token = (req.headers['child-token'] || req.headers['session-token'] || req.headers['token']
+        || q.token || q.childToken || q.sessionToken || body.childToken || body.sessionToken || body.token || '');
+      if (!token) return send(res, 400, { error: 'missing token' });
+      return send(res, 200, { ok: true, signals: drainWebRtcSignals(token) });
+    }
+
+
+    return send(res, 404, { error: 'not found', path: pathname });
   } catch (e) {
     console.error(e);
     return send(res, 500, { error: String(e.message || e) });
