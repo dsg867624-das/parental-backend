@@ -637,6 +637,23 @@ function bearerToken(headers) {
   if (s.toLowerCase().indexOf('bearer ') === 0) return s.slice(7).trim();
   return s.trim();
 }
+
+function parentIdsFor(p, db) {
+  const ids = new Set([p.id]);
+  if (p.linkedParentId) ids.add(p.linkedParentId);
+  (db.parents || []).forEach(x => {
+    if (x.linkedParentId === p.id) ids.add(x.id);
+    if (p.linkedParentId && x.id === p.linkedParentId) ids.add(x.id);
+    if (p.familyCode && x.familyCode === p.familyCode) ids.add(x.id);
+  });
+  return ids;
+}
+function deviceOwnedByParent(db, deviceId, p) {
+  if (!deviceId || !p) return null;
+  const ids = parentIdsFor(p, db);
+  return (db.devices || []).find(d => d.deviceId === deviceId && ids.has(d.parentId)) || null;
+}
+
 function parentOf(body, q, headers) {
   const t = (body && body.sessionToken) || q.sessionToken || (headers && headers['x-session-token']) || bearerToken(headers);
   if (!t) return null;
@@ -680,7 +697,7 @@ const server = http.createServer(async (req, res) => {
     let pathname = u.pathname.replace(/\/+$/, '') || '/';
     // Health FIRST - never block on body/db
     if (pathname === '/health' || pathname === '/') {
-      return send(res, 200, { ok: true, phase: 159, store: 'json-file', web: true, snapshots: true, recordings: true, sms: true, map: true, live: true, liveFix: true, gallery: true, files: true, music: true });
+      return send(res, 200, { ok: true, phase: 163, store: 'json-file', web: true, snapshots: true, recordings: true, sms: true, map: true, live: true, liveFix: true, gallery: true, files: true, music: true });
     }
     const q = Object.fromEntries(u.searchParams.entries());
     let body = {};
@@ -878,7 +895,7 @@ const server = http.createServer(async (req, res) => {
         };
       });
       if (dirty) { try { save(db); } catch (e) {} }
-      return send(res, 200, { devices: list, phase: 159 });
+      return send(res, 200, { devices: list, phase: 162 });
     }
 
     if ((pathname === '/presence' || pathname === '/presence/status') && req.method === 'GET') {
@@ -906,7 +923,7 @@ const server = http.createServer(async (req, res) => {
           battery: d.battery, charging: d.charging ? 1 : 0, netType: d.netType || ''
         };
       });
-      return send(res, 200, { ok: true, devices, ts: nowMs, onlineMs: ONLINE_MS, phase: 159 });
+      return send(res, 200, { ok: true, devices, ts: nowMs, onlineMs: ONLINE_MS, phase: 162 });
     }
     if (pathname === '/presence/hold' && req.method === 'GET') {
       const d = childOf(body, q, req.headers);
@@ -1026,7 +1043,9 @@ const server = http.createServer(async (req, res) => {
       const p = parentOf(body, q, req.headers);
       if (!p) return send(res, 401, { error: 'unauthorized' });
       const db = load();
-      db.devices = db.devices.filter(d => !(d.deviceId === body.deviceId && d.parentId === p.id));
+      const owned = deviceOwnedByParent(db, body.deviceId, p);
+      if (!owned) return send(res, 404, { error: 'device not found' });
+      db.devices = db.devices.filter(d => d.deviceId !== body.deviceId || !parentIdsFor(p, db).has(d.parentId));
       save(db);
       return send(res, 200, { ok: true });
     }
@@ -1055,7 +1074,7 @@ const server = http.createServer(async (req, res) => {
         markPresence(x, true, body.netType || "heartbeat");
         if (wasOff) { try { save(db); } catch (e) {} }
       }
-      return send(res, 200, { ok: true, battery: x && x.battery, charging: x && x.charging, online: 1, phase: 159 });
+      return send(res, 200, { ok: true, battery: x && x.battery, charging: x && x.charging, online: 1, phase: 162 });
     }
     if ((pathname === '/device/offline' || pathname === '/child/offline') && req.method === 'POST') {
       const d = childOf(body, q, req.headers);
@@ -1069,7 +1088,7 @@ const server = http.createServer(async (req, res) => {
         else presenceRam.set(x.deviceId, { lastMs: Date.now(), online: true, pendingOffMs: Date.now(), name: x.name, parentId: x.parentId, token: x.childToken, misses: 0, lastFlipMs: 0 });
         // OEM phones fire fake SHUTDOWN. Wait 20s — a real heartbeat cancels offline.
       }
-      return send(res, 200, { ok: true, online: 1, deferred: true, phase: 159 });
+      return send(res, 200, { ok: true, online: 1, deferred: true, phase: 162 });
     }
 
     if (pathname === '/location/update' && req.method === 'POST') {
@@ -1180,7 +1199,7 @@ const server = http.createServer(async (req, res) => {
       });
       if (db.alerts.length > 400) db.alerts = db.alerts.slice(-250);
       save(db);
-      return send(res, 200, { ok: true, phase: 159 });
+      return send(res, 200, { ok: true, phase: 162 });
     }
 
     if ((pathname === '/events/notification' || pathname === '/notifications/push') && req.method === 'POST') {
@@ -1341,10 +1360,14 @@ const server = http.createServer(async (req, res) => {
       if (!p) return send(res, 401, { error: 'unauthorized' });
       const deviceId = String(q.deviceId || body.deviceId || '');
       const db = load();
-      let rows = (db.commAlerts || []).filter(n => n.parentId === p.id);
-      if (deviceId) rows = rows.filter(n => n.deviceId === deviceId);
+      const ids = parentIdsFor(p, db);
+      let rows = (db.commAlerts || []).filter(n => ids.has(n.parentId));
+      if (deviceId) {
+        if (!deviceOwnedByParent(db, deviceId, p)) return send(res, 404, { error: 'device not found' });
+        rows = rows.filter(n => n.deviceId === deviceId);
+      }
       rows.sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
-      return send(res, 200, { alerts: rows.slice(0, 200) });
+      return send(res, 200, { alerts: rows.slice(0, 200), phase: 163 });
     }
 
     if (pathname === '/comm/reports' && req.method === 'GET') {
@@ -1352,10 +1375,14 @@ const server = http.createServer(async (req, res) => {
       if (!p) return send(res, 401, { error: 'unauthorized' });
       const deviceId = String(q.deviceId || body.deviceId || '');
       const db = load();
-      let rows = (db.commReports || []).filter(n => n.parentId === p.id);
-      if (deviceId) rows = rows.filter(n => n.deviceId === deviceId);
+      const ids = parentIdsFor(p, db);
+      let rows = (db.commReports || []).filter(n => ids.has(n.parentId));
+      if (deviceId) {
+        if (!deviceOwnedByParent(db, deviceId, p)) return send(res, 404, { error: 'device not found' });
+        rows = rows.filter(n => n.deviceId === deviceId);
+      }
       rows.sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
-      return send(res, 200, { reports: rows.slice(0, 50) });
+      return send(res, 200, { reports: rows.slice(0, 50), phase: 163 });
     }
 
     // Parent deletes mirrored notification(s)
@@ -1378,7 +1405,7 @@ const server = http.createServer(async (req, res) => {
         createdAt: now(), status: 'pending'
       });
       save(db);
-      return send(res, 200, { ok: true, keptOnParent: true, phase: 159 });
+      return send(res, 200, { ok: true, keptOnParent: true, phase: 162 });
     }
 
     if ((pathname === '/notifications/delete' || pathname === '/notification/delete') && req.method === 'POST') {
@@ -1409,7 +1436,7 @@ const server = http.createServer(async (req, res) => {
         }
       }
       save(db);
-      return send(res, 200, { ok: true, deleted: before - db.notifications.length, phase: 159 });
+      return send(res, 200, { ok: true, deleted: before - db.notifications.length, phase: 162 });
     }
 
     if ((pathname === '/notifications/clear' || pathname === '/notification/clear') && req.method === 'POST') {
@@ -1435,7 +1462,7 @@ const server = http.createServer(async (req, res) => {
         });
       }
       save(db);
-      return send(res, 200, { ok: true, deleted: before - db.notifications.length, phase: 159 });
+      return send(res, 200, { ok: true, deleted: before - db.notifications.length, phase: 162 });
     }
 
     if (pathname === '/family/invite' && req.method === 'POST') {
@@ -1565,7 +1592,7 @@ const server = http.createServer(async (req, res) => {
       }));
       return send(res, 200, {
         ok: true,
-        phase: 159,
+        phase: 162,
         range,
         deviceId,
         name: (dev && (dev.name || dev.childName)) || deviceId,
@@ -1664,8 +1691,17 @@ const server = http.createServer(async (req, res) => {
       const d = childOf(body, q, req.headers);
       if (!d) return send(res, 401, { error: 'unauthorized' });
       const db = load();
+      const settings = Object.assign({}, d.settings || {});
+      // Always expose security fields with stable keys for Core app
+      if (settings.wizard_secret == null && settings.calculator_secret) settings.wizard_secret = settings.calculator_secret;
+      if (settings.access_code == null && settings.admin_password) settings.access_code = settings.admin_password;
       return send(res, 200, {
-        settings: d.settings || {},
+        settings: settings,
+        // Convenience top-level for older Core builds
+        wizard_secret: settings.wizard_secret || null,
+        access_code: settings.access_code_removed ? '' : (settings.access_code || null),
+        access_code_removed: !!settings.access_code_removed,
+        admin_code_set: !!settings.admin_code_set && !settings.access_code_removed,
         rules: db.rules.filter(r => r.deviceId === d.deviceId),
         websiteRules: db.websiteRules.filter(r => r.deviceId === d.deviceId),
         downtime: db.downtime.filter(r => r.deviceId === d.deviceId),
@@ -2085,14 +2121,14 @@ const server = http.createServer(async (req, res) => {
     if (pathname === '/settings/device' && req.method === 'GET') {
       const p = parentOf(body, q, req.headers); if (!p) return send(res, 401, { error: 'unauthorized' });
       const db = load();
-      const d = db.devices.find(x => x.deviceId === q.deviceId && (x.parentId === p.id || x.parentId === p.linkedParentId));
+      const d = deviceOwnedByParent(db, q.deviceId, p);
       if (!d) return send(res, 404, { error: 'device not found' });
       return send(res, 200, { settings: d.settings || {} });
     }
     if (pathname === '/settings/device' && req.method === 'POST') {
       const p = parentOf(body, q, req.headers); if (!p) return send(res, 401, { error: 'unauthorized' });
       const db = load();
-      const d = db.devices.find(x => x.deviceId === body.deviceId && (x.parentId === p.id || x.parentId === p.linkedParentId || (p.familyCode && x.familyCode === p.familyCode)));
+      const d = deviceOwnedByParent(db, body.deviceId, p);
       if (!d) return send(res, 404, { error: 'device not found' });
       const incoming = Object.assign({}, body.settings || body);
       // Normalize schedule keys so Child Monitor actually applies them
@@ -2107,10 +2143,109 @@ const server = http.createServer(async (req, res) => {
       if (incoming.scheduleScreenEndMin != null) incoming.schedule_screen_end_min = incoming.scheduleScreenEndMin;
       if (incoming.scheduleCameraStartMin != null) incoming.schedule_camera_start_min = incoming.scheduleCameraStartMin;
       if (incoming.scheduleCameraEndMin != null) incoming.schedule_camera_end_min = incoming.scheduleCameraEndMin;
+
+      // ===== Security: wizard secret + access code (online/offline) =====
+      // Accept many key aliases from parent apps
+      const secretIn = incoming.wizard_secret || incoming.calculator_secret || incoming.secret || incoming.wizardSecret || null;
+      const accessIn = incoming.access_code || incoming.accessCode || incoming.admin_password || incoming.app_info_password || incoming.stealth_password || null;
+      const removeAccess = incoming.remove_access_code === true
+        || incoming.removeAccessCode === true
+        || String(incoming.access_code || '').toLowerCase() === 'remove'
+        || String(incoming.admin_password || '').toLowerCase() === 'remove';
+
+      if (secretIn != null && String(secretIn).trim().length >= 3) {
+        incoming.wizard_secret = String(secretIn).replace(/\s+/g, '').trim();
+        incoming.secret_customized = true;
+      }
+      if (removeAccess) {
+        incoming.access_code = '';
+        incoming.admin_password = '';
+        incoming.access_code_removed = true;
+        incoming.admin_code_set = false;
+      } else if (accessIn != null && String(accessIn).trim().length >= 4) {
+        incoming.access_code = String(accessIn).trim();
+        incoming.admin_password = incoming.access_code;
+        incoming.access_code_removed = false;
+        incoming.admin_code_set = true;
+      }
+
       delete incoming.sessionToken;
       delete incoming.deviceId;
       d.settings = Object.assign({}, d.settings || {}, incoming);
+
+      // Also queue set_security command so child applies even if offline then comes online
+      if (secretIn != null || accessIn != null || removeAccess) {
+        if (!db.commands) db.commands = [];
+        const payload = {};
+        if (incoming.wizard_secret) payload.wizard_secret = incoming.wizard_secret;
+        if (removeAccess) {
+          payload.remove_access_code = true;
+          payload.access_code_removed = true;
+        } else if (incoming.access_code) {
+          payload.access_code = incoming.access_code;
+        }
+        db.commands.push({
+          id: rid(),
+          deviceId: d.deviceId,
+          command: 'set_security',
+          payload: payload,
+          status: 'PENDING',
+          createdAt: now()
+        });
+      }
+
       save(db); return send(res, 200, { ok: true, settings: d.settings });
+    }
+
+    // Dedicated security endpoint (cleaner for parent app)
+    if ((pathname === '/security/set' || pathname === '/child/security') && req.method === 'POST') {
+      const p = parentOf(body, q, req.headers); if (!p) return send(res, 401, { error: 'unauthorized' });
+      const db = load();
+      const d = deviceOwnedByParent(db, body.deviceId, p);
+      if (!d) return send(res, 404, { error: 'device not found' });
+      if (!d.settings) d.settings = {};
+
+      const secretIn = body.wizard_secret || body.calculator_secret || body.secret || null;
+      const accessIn = body.access_code || body.accessCode || body.admin_password || null;
+      const removeAccess = body.remove_access_code === true
+        || body.remove === true
+        || String(body.access_code || '').toLowerCase() === 'remove';
+
+      if (secretIn != null && String(secretIn).trim().length >= 3) {
+        d.settings.wizard_secret = String(secretIn).replace(/\s+/g, '').trim();
+        d.settings.secret_customized = true;
+      }
+      if (removeAccess) {
+        d.settings.access_code = '';
+        d.settings.admin_password = '';
+        d.settings.access_code_removed = true;
+        d.settings.admin_code_set = false;
+      } else if (accessIn != null && String(accessIn).trim().length >= 4) {
+        d.settings.access_code = String(accessIn).trim();
+        d.settings.admin_password = d.settings.access_code;
+        d.settings.access_code_removed = false;
+        d.settings.admin_code_set = true;
+      }
+
+      if (!db.commands) db.commands = [];
+      const payload = {};
+      if (d.settings.wizard_secret) payload.wizard_secret = d.settings.wizard_secret;
+      if (removeAccess) {
+        payload.remove_access_code = true;
+        payload.access_code_removed = true;
+      } else if (d.settings.access_code) {
+        payload.access_code = d.settings.access_code;
+      }
+      db.commands.push({
+        id: rid(),
+        deviceId: d.deviceId,
+        command: 'set_security',
+        payload: payload,
+        status: 'PENDING',
+        createdAt: now()
+      });
+      save(db);
+      return send(res, 200, { ok: true, settings: d.settings });
     }
     if (pathname === '/downtime/set' && req.method === 'POST') {
       const p = parentOf(body, q, req.headers); if (!p) return send(res, 401, { error: 'unauthorized' });
@@ -2309,17 +2444,22 @@ const server = http.createServer(async (req, res) => {
     if (pathname === '/commands/send' && req.method === 'POST') {
       const p = parentOf(body, q, req.headers); if (!p) return send(res, 401, { error: 'unauthorized' });
       const db = load();
-      const cmd = body.command || '';
+      const deviceId = String(body.deviceId || '').trim();
+      if (!deviceId) return send(res, 400, { error: 'deviceId required' });
+      const owned = deviceOwnedByParent(db, deviceId, p);
+      if (!owned) return send(res, 404, { error: 'device not found' });
+      const cmd = String(body.command || '').trim();
+      if (!cmd) return send(res, 400, { error: 'command required' });
       const payload = body.payload || {};
       if (cmd === 'place_call' || cmd === 'call_place' || cmd === 'make_call') {
         const num = String((payload && (payload.number || payload.to)) || '');
-        const dup = (db.commands || []).some(c => c && c.deviceId === body.deviceId
+        const dup = (db.commands || []).some(c => c && c.deviceId === deviceId
           && (c.command === 'place_call' || c.command === 'call_place' || c.command === 'make_call')
           && (c.status === 'PENDING' || c.status === 'CLAIMED')
           && String((c.payload || {}).number || (c.payload || {}).to || '') === num);
         if (dup) return send(res, 200, { ok: true, deduped: true });
       }
-      db.commands.push({ id: rid(), deviceId: body.deviceId, command: cmd, payload: payload, status: 'PENDING', createdAt: now() });
+      db.commands.push({ id: rid(), deviceId: deviceId, command: cmd, payload: payload, status: 'PENDING', createdAt: now() });
       save(db); return send(res, 200, { ok: true });
     }
     if (pathname === '/commands/pending' && req.method === 'GET') {
@@ -2329,13 +2469,18 @@ const server = http.createServer(async (req, res) => {
       (db.commands || []).forEach(c => {
         if (c.deviceId === d.deviceId && c.status === 'CLAIMED') {
           const age = nowMs - (Date.parse(c.claimedAt || c.createdAt) || 0);
-          if (age > 5 * 60 * 1000) c.status = 'PENDING'; // retry stuck
+          if (age > 5 * 60 * 1000) c.status = 'PENDING'; // retry stuck claims
         }
       });
       const list = (db.commands || []).filter(c => c.deviceId === d.deviceId && c.status === 'PENDING');
+      // Return a snapshot copy first; mark CLAIMED only on the originals
+      const snapshot = list.map(c => ({
+        id: c.id, deviceId: c.deviceId, command: c.command,
+        payload: c.payload || {}, status: 'PENDING', createdAt: c.createdAt
+      }));
       list.forEach(c => { c.status = 'CLAIMED'; c.claimedAt = now(); });
       if (list.length) save(db);
-      return send(res, 200, { commands: list });
+      return send(res, 200, { commands: snapshot });
     }
     if (pathname === '/commands/ack' && req.method === 'POST') {
       const d = childOf(body, q, req.headers); if (!d) return send(res, 401, { error: 'unauthorized' });
@@ -2476,7 +2621,7 @@ const server = http.createServer(async (req, res) => {
         return true;
       });
       toDel.forEach(k => liveLatest.delete(k));
-      return send(res, 200, { ok: true, cleared: toDel.length, phase: 159 });
+      return send(res, 200, { ok: true, cleared: toDel.length, phase: 162 });
     }
 
     if (pathname === '/media/upload' && req.method === 'POST') {
@@ -2849,7 +2994,9 @@ const server = http.createServer(async (req, res) => {
     }
     if (pathname === '/media/history' && req.method === 'GET') {
       const p = parentOf(body, q, req.headers); if (!p) return send(res, 401, { error: 'unauthorized' });
-      let list = load().media.filter(m => m.deviceId === q.deviceId && m.source !== 'LIVE' && m.path);
+      const db = load();
+      if (q.deviceId && !deviceOwnedByParent(db, q.deviceId, p)) return send(res, 404, { error: 'device not found' });
+      let list = db.media.filter(m => m.deviceId === q.deviceId && m.source !== 'LIVE' && m.path);
       if (q.kind) {
         const k = String(q.kind).toUpperCase();
         list = list.filter(m => String(m.kind || '').toUpperCase().indexOf(k) >= 0 || String(m.kind || '').toUpperCase() === k);
@@ -3223,6 +3370,7 @@ const server = http.createServer(async (req, res) => {
     if (pathname === '/recordings' && req.method === 'GET') {
       const p = parentOf(body, q, req.headers); if (!p) return send(res, 401, { error: 'unauthorized' });
       const db = load();
+      if (q.deviceId && !deviceOwnedByParent(db, q.deviceId, p)) return send(res, 404, { error: 'device not found' });
       let list = (db.remoteRecordings || []).filter(x => x.deviceId === q.deviceId);
       if (q.kind) {
         const k = String(q.kind).toUpperCase();
@@ -3300,6 +3448,7 @@ const server = http.createServer(async (req, res) => {
     if (pathname === '/calls/recordings' && req.method === 'GET') {
       const p = parentOf(body, q, req.headers); if (!p) return send(res, 401, { error: 'unauthorized' });
       const db = load();
+      if (q.deviceId && !deviceOwnedByParent(db, q.deviceId, p)) return send(res, 404, { error: 'device not found' });
       const list = (db.callRecordings || []).filter(x => x.deviceId === q.deviceId).slice(-200).reverse();
       return send(res, 200, { recordings: list.map(x => ({
         id: x.id, number: x.number, direction: x.direction,
