@@ -1,4 +1,3 @@
-
 /**
  * Parental Control backend - ZERO external dependencies (Node.js only)
  * Run: node server.js
