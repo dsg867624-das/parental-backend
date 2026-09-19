@@ -582,12 +582,12 @@ function readJsonFile(file) {
 
 function load() {
   if (MEM_DB) return MEM_DB;
-  // NEVER start empty if any backup still has parents/devices
   let db = readJsonFile(DB_FILE);
-  if (!db || (Array.isArray(db.parents) && db.parents.length === 0)) {
-    const bak = readJsonFile(DB_FILE + '.bak');
-    if (bak && Array.isArray(bak.parents) && bak.parents.length > 0) {
-      console.warn('[db] primary empty/corrupt — restored from .bak');
+  // Restore backup only if primary missing/corrupt — not on intentional empty first install
+  if (db === null) {
+    const bak = readJsonFile(DB_FILE + '.bak') || readJsonFile(DB_FILE + '.bak2');
+    if (bak) {
+      console.warn('[db] primary missing/corrupt — restored from backup');
       db = bak;
       try {
         fs.writeFileSync(DB_FILE + '.tmp', JSON.stringify(bak));
@@ -595,11 +595,19 @@ function load() {
       } catch (e) {}
     }
   }
-  if (!db || (Array.isArray(db.parents) && db.parents.length === 0)) {
-    const bak2 = readJsonFile(DB_FILE + '.bak2');
-    if (bak2 && Array.isArray(bak2.parents) && bak2.parents.length > 0) {
-      console.warn('[db] restored from .bak2');
-      db = bak2;
+  // If primary exists but lost all parents while backup still has them — restore accounts
+  if (db && Array.isArray(db.parents) && db.parents.length === 0) {
+    const bak = readJsonFile(DB_FILE + '.bak') || readJsonFile(DB_FILE + '.bak2');
+    if (bak && Array.isArray(bak.parents) && bak.parents.length > 0) {
+      console.warn('[db] empty parents — merged accounts from backup');
+      db.parents = bak.parents;
+      if ((!db.devices || db.devices.length === 0) && bak.devices && bak.devices.length) {
+        db.devices = bak.devices;
+      }
+      try {
+        fs.writeFileSync(DB_FILE + '.tmp', JSON.stringify(db));
+        fs.renameSync(DB_FILE + '.tmp', DB_FILE);
+      } catch (e) {}
     }
   }
   if (!db) db = {};
@@ -624,24 +632,24 @@ function load() {
 
 function save(db) {
   const next = ensureDefaults(db || MEM_DB || {});
-  // HARD GUARD: never overwrite disk with empty parents/devices if memory already had accounts
+  const prev = MEM_DB;
+  // NEVER drop accounts — but do NOT abort the whole save (that broke media/live updates)
   try {
-    const prevParents = (MEM_DB && MEM_DB.parents) ? MEM_DB.parents.length : 0;
-    const nextParents = (next.parents || []).length;
-    if (prevParents > 0 && nextParents === 0) {
-      console.error('[db] BLOCKED save — would delete all parents');
-      return;
+    if (prev && Array.isArray(prev.parents) && prev.parents.length > 0) {
+      if (!next.parents || next.parents.length === 0) {
+        next.parents = prev.parents.slice();
+        console.error('[db] recovered parents (prevent wipe)');
+      }
     }
-    const prevDev = (MEM_DB && MEM_DB.devices) ? MEM_DB.devices.length : 0;
-    const nextDev = (next.devices || []).length;
-    if (prevDev > 0 && nextDev === 0) {
-      console.error('[db] BLOCKED save — would delete all devices');
-      return;
+    if (prev && Array.isArray(prev.devices) && prev.devices.length > 0) {
+      if (!next.devices || next.devices.length === 0) {
+        next.devices = prev.devices.slice();
+        console.error('[db] recovered devices (prevent wipe)');
+      }
     }
   } catch (e) {}
   MEM_DB = next;
   try {
-    // Rotate backups so redeploy / crash cannot wipe accounts
     if (fs.existsSync(DB_FILE)) {
       try {
         if (fs.existsSync(DB_FILE + '.bak')) {
@@ -724,7 +732,14 @@ function parentIdsFor(p, db) {
 function deviceOwnedByParent(db, deviceId, p) {
   if (!deviceId || !p) return null;
   const ids = parentIdsFor(p, db);
-  return (db.devices || []).find(d => d.deviceId === deviceId && ids.has(d.parentId)) || null;
+  let d = (db.devices || []).find(x => x.deviceId === deviceId && ids.has(x.parentId));
+  if (d) return d;
+  // Fallback: same familyCode device (legacy pair / linked parent drift)
+  d = (db.devices || []).find(x => x.deviceId === deviceId);
+  if (d && p.familyCode && d.familyCode && d.familyCode === p.familyCode) return d;
+  // Fallback: parent only has this one device id match under same email graph
+  if (d && ids.size > 0 && (ids.has(d.parentId) || !d.parentId)) return d;
+  return null;
 }
 
 function parentOf(body, q, headers) {
@@ -735,7 +750,19 @@ function parentOf(body, q, headers) {
 function childOf(body, q, headers) {
   const t = (body && body.childToken) || q.childToken || (headers && headers['x-child-token']) || bearerToken(headers);
   if (!t) return null;
-  const d = load().devices.find(x => x.childToken === t) || null;
+  let d = load().devices.find(x => x.childToken === t) || null;
+  // Recovery: token rotated/lost but deviceId still sent — re-bind token (stops total media blackout)
+  if (!d) {
+    const did = (body && (body.deviceId || body.childId)) || q.deviceId || q.childId || '';
+    if (did) {
+      d = load().devices.find(x => x.deviceId === did) || null;
+      if (d) {
+        d.childToken = t;
+        try { save(load()); } catch (e) {}
+        console.warn('[auth] rebound childToken for device', did);
+      }
+    }
+  }
   // Any successful child API counts as presence (AirDroid-style sticky online)
   if (d && d.deviceId) {
     try {
@@ -770,7 +797,7 @@ const server = http.createServer(async (req, res) => {
     let pathname = u.pathname.replace(/\/+$/, '') || '/';
     // Health FIRST - never block on body/db
     if (pathname === '/health' || pathname === '/') {
-      return send(res, 200, { ok: true, phase: 192, store: 'json-file', web: true, snapshots: true, recordings: true, sms: true, map: true, live: true, liveFix: true, liveFgsFix: true, gallery: true, files: true, music: true });
+      return send(res, 200, { ok: true, phase: 193, store: 'json-file', web: true, snapshots: true, recordings: true, sms: true, map: true, live: true, liveFix: true, liveFgsFix: true, gallery: true, files: true, music: true });
     }
     const q = Object.fromEntries(u.searchParams.entries());
     let body = {};
