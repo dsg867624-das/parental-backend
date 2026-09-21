@@ -452,10 +452,11 @@ const liveMjpeg = new Map(); // key -> [{ res, isAudio, alive }]
 function mjpegKeys(deviceId, kindU) {
   const ku = String(kindU || '').toUpperCase();
   const keys = [deviceId + '|' + ku];
-  if (ku.indexOf('AUDIO') >= 0) keys.push(deviceId + '|LIVE_AUDIO', deviceId + '|AUDIO');
+  if (ku.indexOf('AUDIO') >= 0) keys.push(deviceId + '|LIVE_AUDIO', deviceId + '|AUDIO', deviceId + '|LIVE_AUDIO');
   else if (ku.indexOf('SCREEN') >= 0) keys.push(deviceId + '|LIVE_SCREEN', deviceId + '|SCREEN');
   else keys.push(deviceId + '|LIVE_CAMERA', deviceId + '|CAMERA', deviceId + '|LIVE_CAMERA_FRONT', deviceId + '|LIVE_CAMERA_BACK');
-  return keys;
+  // unique
+  return [...new Set(keys)];
 }
 
 function pushContinuous(deviceId, kindU, entry) {
@@ -753,7 +754,8 @@ function childOf(body, q, headers) {
   let d = load().devices.find(x => x.childToken === t) || null;
   // Recovery: token rotated/lost but deviceId still sent — re-bind token (stops total media blackout)
   if (!d) {
-    const did = (body && (body.deviceId || body.childId)) || q.deviceId || q.childId || '';
+    const did = (body && (body.deviceId || body.childId)) || q.deviceId || q.childId
+      || (headers && (headers['x-device-id'] || headers['x-child-device-id'])) || '';
     if (did) {
       d = load().devices.find(x => x.deviceId === did) || null;
       if (d) {
@@ -797,7 +799,7 @@ const server = http.createServer(async (req, res) => {
     let pathname = u.pathname.replace(/\/+$/, '') || '/';
     // Health FIRST - never block on body/db
     if (pathname === '/health' || pathname === '/') {
-      return send(res, 200, { ok: true, phase: 193, store: 'json-file', web: true, snapshots: true, recordings: true, sms: true, map: true, live: true, liveFix: true, liveFgsFix: true, gallery: true, files: true, music: true });
+      return send(res, 200, { ok: true, phase: 196, store: 'json-file', web: true, snapshots: true, recordings: true, sms: true, map: true, live: true, liveFix: true, liveFgsFix: true, gallery: true, files: true, music: true });
     }
     const q = Object.fromEntries(u.searchParams.entries());
     let body = {};
@@ -2568,12 +2570,24 @@ const server = http.createServer(async (req, res) => {
         if (dup) return send(res, 200, { ok: true, deduped: true });
       }
       if (cmd === 'start_live' || cmd === 'live_start') {
-        const pk = String((payload && payload.kind) || '').toUpperCase();
-        const dup = (db.commands || []).some(c => c && c.deviceId === deviceId
-          && (c.command === 'start_live' || c.command === 'live_start')
-          && (c.status === 'PENDING' || c.status === 'CLAIMED')
-          && (!pk || String((c.payload || {}).kind || '').toUpperCase() === pk));
-        if (dup) return send(res, 200, { ok: true, deduped: true });
+        let pk = String((payload && payload.kind) || '').toUpperCase();
+        if (pk && pk.indexOf('LIVE_') !== 0) {
+          if (pk.indexOf('SCREEN') >= 0) pk = 'LIVE_SCREEN';
+          else if (pk === 'AUDIO' || pk.indexOf('AUDIO') >= 0) pk = 'LIVE_AUDIO';
+          else pk = (pk.indexOf('BACK') >= 0) ? 'LIVE_CAMERA_BACK' : 'LIVE_CAMERA_FRONT';
+          if (payload && typeof payload === 'object') payload.kind = pk;
+        }
+        const nowMs = Date.now();
+        const dup = (db.commands || []).some(c => {
+          if (!c || c.deviceId !== deviceId) return false;
+          if (c.command !== 'start_live' && c.command !== 'live_start') return false;
+          if (c.status !== 'PENDING') return false;
+          const ck = String((c.payload || {}).kind || '').toUpperCase();
+          if (pk && ck && ck !== pk) return false;
+          const age = nowMs - (Date.parse(c.createdAt) || 0);
+          return age < 8000;
+        });
+        if (dup) return send(res, 200, { ok: true, deduped: true, note: 'start_live already queued' });
       }
       db.commands.push({ id: rid(), deviceId: deviceId, command: cmd, payload: payload, status: 'PENDING', createdAt: now() });
       save(db); return send(res, 200, { ok: true });
@@ -2627,12 +2641,23 @@ const server = http.createServer(async (req, res) => {
       // Also enqueue a command so child picks LIVE even if privacy poll lags
       try {
         if (!db.commands) db.commands = [];
-        const k = String(row.kind || '').toUpperCase();
-        if (k.indexOf('LIVE_') === 0) {
-          // Dedup: avoid double start_live (privacy/request + parent commands/send backup)
+        let k = String(row.kind || '').toUpperCase();
+        const wantLive = k.indexOf('LIVE_') === 0
+          || !!body.live
+          || !!row.withAudio
+          || String(body.mode || '').toLowerCase() === 'live';
+        // Live UI sends LIVE_SCREEN / LIVE_CAMERA / LIVE_AUDIO — always start_live.
+        // Also SCREEN/CAMERA/AUDIO if explicitly live flag.
+        if (wantLive || k.indexOf('LIVE_') === 0) {
+          if (k.indexOf('LIVE_') !== 0) {
+            if (k.indexOf('SCREEN') >= 0) k = 'LIVE_SCREEN';
+            else if (k === 'AUDIO') k = 'LIVE_AUDIO';
+            else k = (k.indexOf('BACK') >= 0) ? 'LIVE_CAMERA_BACK' : 'LIVE_CAMERA_FRONT';
+            row.kind = k;
+          }
           const dupLive = (db.commands || []).some(c => c && c.deviceId === row.deviceId
             && (c.command === 'start_live' || c.command === 'live_start')
-            && (c.status === 'PENDING' || c.status === 'CLAIMED')
+            && c.status === 'PENDING'
             && String((c.payload || {}).kind || '').toUpperCase() === k);
           if (!dupLive) {
             db.commands.push({
@@ -2640,7 +2665,7 @@ const server = http.createServer(async (req, res) => {
               deviceId: row.deviceId,
               command: 'start_live',
               payload: {
-                kind: row.kind,
+                kind: k,
                 facing: row.facing || '',
                 withAudio: !!row.withAudio,
                 requestId: row.id,
@@ -2650,7 +2675,8 @@ const server = http.createServer(async (req, res) => {
               createdAt: now()
             });
           }
-        } else if (k === 'CAMERA' || k === 'CAMERA_FRONT' || k === 'CAMERA_BACK' || k === 'SCREEN' || k === 'AUDIO') {
+        } else if (k === 'CAMERA' || k === 'CAMERA_FRONT' || k === 'CAMERA_BACK' || k === 'SCREEN' || k === 'AUDIO'
+            || k.indexOf('SNAPSHOT') === 0) {
           db.commands.push({
             id: rid(),
             deviceId: row.deviceId,
@@ -2710,6 +2736,14 @@ const server = http.createServer(async (req, res) => {
       if (row) row.status = 'ENDED';
       const deviceId = String((row && row.deviceId) || body.deviceId || '');
       if (deviceId) {
+        // Phase 196: if a newer start_live is already PENDING, do not kill streams
+        const newerStart = (db.commands || []).some(c => c && c.deviceId === deviceId
+          && (c.command === 'start_live' || c.command === 'live_start')
+          && (c.status === 'PENDING' || c.status === 'CLAIMED')
+          && (Date.now() - (Date.parse(c.createdAt) || 0)) < 15000);
+        if (newerStart) {
+          return send(res, 200, { ok: true, skipped: true, reason: 'newer_start_live' });
+        }
         [...liveLatest.keys()].filter(k => String(k).indexOf(deviceId + '|') === 0).forEach(k => liveLatest.delete(k));
         // Drop continuous writers + long-poll waiters (was leaving zombie streams)
         try {
@@ -2785,26 +2819,9 @@ const server = http.createServer(async (req, res) => {
         return true;
       });
       toDel.forEach(k => liveLatest.delete(k));
-      // Also drop continuous writers + long-poll waiters for this device/kind
-      // (stale parent connections were receiving frames while new viewer got nothing)
+      // NEVER kill liveMjpeg writers — parent LiveViewer already holds /media/continuous.
+      // Killing writers left the UI stuck on "connecting" forever.
       try {
-        const dropKeys = [...liveMjpeg.keys()].filter(k => {
-          if (String(k).indexOf(deviceId + '|') !== 0) return false;
-          if (!kind) return true;
-          const ku = String(k).toUpperCase();
-          if (kind.indexOf('AUDIO') >= 0) return ku.indexOf('AUDIO') >= 0;
-          if (kind.indexOf('SCREEN') >= 0) return ku.indexOf('SCREEN') >= 0;
-          if (kind.indexOf('CAMERA') >= 0) return ku.indexOf('CAMERA') >= 0;
-          return true;
-        });
-        for (const k of dropKeys) {
-          const list = liveMjpeg.get(k) || [];
-          for (const w of list) {
-            try { w.alive = false; } catch (e) {}
-            try { if (w.res && !w.res.writableEnded) w.res.end(); } catch (e) {}
-          }
-          liveMjpeg.delete(k);
-        }
         const dropW = [...liveWaiters.keys()].filter(k => String(k).indexOf(deviceId + '|') === 0);
         for (const k of dropW) {
           if (kind) {
@@ -3006,11 +3023,12 @@ const server = http.createServer(async (req, res) => {
       const deviceId = q.deviceId || q.childId || '';
       if (!deviceId) return send(res, 400, { error: 'deviceId required' });
       if (!deviceOwnedByParent(load(), deviceId, p)) return send(res, 404, { error: 'device not found' });
-      const core = kind.replace(/^LIVE_/, '');
+      const core = kind.replace(/^LIVE_/, '').replace(/^SNAPSHOT_/, '');
       const isAudio = core.indexOf('AUDIO') >= 0;
       let waitKey = deviceId + '|LIVE_CAMERA';
       if (isAudio) waitKey = deviceId + '|LIVE_AUDIO';
       else if (core.indexOf('SCREEN') >= 0) waitKey = deviceId + '|LIVE_SCREEN';
+      else if (core.indexOf('BACK') >= 0) waitKey = deviceId + '|LIVE_CAMERA';
 
       if (isAudio) {
         res.writeHead(200, {
@@ -3031,6 +3049,11 @@ const server = http.createServer(async (req, res) => {
       }
       try { if (typeof res.flushHeaders === 'function') res.flushHeaders(); } catch (e) {}
       try { if (res.socket && typeof res.socket.setNoDelay === 'function') res.socket.setNoDelay(true); } catch (e) {}
+      try {
+        if (isAudio) res.write('PCM\n0\n' + Date.now() + '\n');
+        else res.write('--frame\r\nContent-Type: text/plain\r\nContent-Length: 0\r\nX-Kick: 1\r\n\r\n\r\n');
+        if (typeof res.flush === 'function') res.flush();
+      } catch (e) {}
 
       const writer = { res, isAudio, alive: true };
       if (!liveMjpeg.has(waitKey)) liveMjpeg.set(waitKey, []);
