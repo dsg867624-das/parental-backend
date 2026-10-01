@@ -53,14 +53,11 @@ function pushWebRtcSignal(token, signal) {
   }
 }
 function drainWebRtcSignals(token) {
-  const keys = webrtcAliasTokens(token);
-  const out = [];
-  for (const t of keys) {
-    const arr = webrtcSignals[t] || [];
-    webrtcSignals[t] = [];
-    for (const s of arr) out.push(s);
-  }
-  return out;
+  // Drain ONLY the polled key so parent/child cannot steal each other's mailbox.
+  const t = String(token || '');
+  const arr = webrtcSignals[t] || [];
+  webrtcSignals[t] = [];
+  return arr;
 }
 
 
@@ -2885,6 +2882,26 @@ const server = http.createServer(async (req, res) => {
       save(db);
       return send(res, 200, { ok: true, contact: hit || { name, number } });
     }
+    if ((pathname === '/calls/end' || pathname === '/call/end' || pathname === '/calls/hangup') && req.method === 'POST') {
+      const p = parentOf(body, q, req.headers); if (!p) return send(res, 401, { error: 'unauthorized' });
+      const deviceId = String(body.deviceId || q.deviceId || '').trim();
+      if (!deviceId) return send(res, 400, { error: 'deviceId required' });
+      const db = load();
+      const recent = (db.commands || []).some(c => c && String(c.deviceId||'') === String(deviceId||'')
+        && (c.command === 'end_call' || c.command === 'hangup' || c.command === 'call_off')
+        && (c.status === 'PENDING' || c.status === 'CLAIMED')
+        && (c.createdAt && (Date.now() - new Date(c.createdAt).getTime()) < 8000));
+      if (!recent) {
+        db.commands.push({
+          id: rid(), deviceId, command: 'end_call',
+          payload: { reason: 'parent' },
+          status: 'PENDING', createdAt: now()
+        });
+        save(db);
+      }
+      return send(res, 200, { ok: true, queued: !recent });
+    }
+
     if ((pathname === '/calls/place' || pathname === '/call/place') && req.method === 'POST') {
       const p = parentOf(body, q, req.headers); if (!p) return send(res, 401, { error: 'unauthorized' });
       const deviceId = String(body.deviceId || q.deviceId || '').trim();
